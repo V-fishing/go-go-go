@@ -11,3 +11,12 @@ analysis_logs/
 *.npz
 *.npy
 *.jsonl
+
+# 对局记录与个人环境标定(不随仓库分发)
+games/
+avatar_calib.json
+grid.json
+grid_calib.json
+
+# AI 协作内部文件
+CLAUDE.md

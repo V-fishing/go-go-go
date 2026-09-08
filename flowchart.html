@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>腾讯围棋 AI 陪练 - 完整流程图</title>
+<style>
+  body { background:#f7f7f2; margin:24px; font-family:"Microsoft YaHei", sans-serif; }
+  h1 { font-size:20px; color:#333; }
+  .mermaid { background:#fff; padding:20px; border-radius:10px;
+             box-shadow:0 1px 6px rgba(0,0,0,.12); overflow:auto; }
+  .legend { margin-top:16px; color:#555; font-size:13px; line-height:1.8; }
+</style>
+</head>
+<body>
+<h1>腾讯围棋 AI 陪练 — 启动到终局完整流程</h1>
+<div class="mermaid">
+flowchart TD
+    START(["启动 katago_play"]) --> ARGS["参数解析<br/>执色 黑/白/auto · --turn · --visits<br/>--size · --wait-new · --beep"]
+    ARGS --> WARM["引擎后台预热"]
+    WARM --> WAITWIN{"等待窗口 ≤30s<br/>动态 PID 解析"}
+    WAITWIN -- "超时" --> WINFAIL["提示: 请打开对局画面<br/>退出"]
+    WAITWIN -- "找到" --> INIT["读取初始盘面<br/>连续两次一致 ≤15 次"]
+    INIT --> COLOR{"执色识别<br/>auto?"}
+    COLOR -- "是" --> AVATAR["头像角标颜色<br/>2帧投票 × 8 次重试"]
+    AVATAR -- "成功" --> COLOROK["我方=黑/白"]
+    AVATAR -- "失败" --> PAGEDIAG{"页面诊断"}
+    PAGEDIAG -- "结算/棋谱页" --> PAGEHINT["专属提示: 请开新局"]
+    PAGEDIAG -- "对局页" --> COLORFAIL["停止<br/>UI 弹人工兜底对话框"]
+    COLOR -- "否 手动指定" --> COLOROK
+    COLOROK --> SCENE{"场景安检<br/>复盘/棋谱/结算词?"}
+    SCENE -- "是" --> REJECT["拒绝启动<br/>--force-any 可绕过"]
+    SCENE -- "否" --> TURN{"行棋方锚定"}
+    TURN -- "已指定 --turn" --> TURNOK
+    TURN -- "未指定" --> BANNER0["读横幅 黑方/白方行棋<br/>分级放大 ×14 重试"]
+    BANNER0 -- "成功" --> TURNOK
+    BANNER0 -- "失败" --> TURNFAIL["诊断提示 + 人工兜底<br/>停止"]
+    TURNOK --> TREND0["清趋势文件<br/>记录第 0 点"]
+    TREND0 --> LOOP
+
+    LOOP["主循环 ~0.3-0.5s/轮"] --> READ["读盘<br/>尺寸OCR缓存 + 网格 + 悬停屏蔽"]
+    READ --> SIZEDB{"尺寸变化?"}
+    SIZEDB -- "是" --> SIZE2{"连续两轮同尺寸?"}
+    SIZE2 -- "否" --> SKIP["跳过本轮<br/>防过渡垃圾帧"]
+    SIZE2 -- "是" --> SIZECHG["清网格缓存<br/>重置基准"]
+    SIZECHG --> CHK
+    SIZEDB -- "否" --> CHK{"盘面变化?<br/>双读确认<br/>开局三读"}
+    CHK -- "无新增子" --> CHKX["忽略<br/>悔棋/撤销"]
+    CHK -- "跳变 &gt;3" --> CHKX
+    CHK -- "接受落子" --> ACCEPT["记 SGF · 提子动画窗口<br/>按落子方算术翻转轮次<br/>横幅交叉校验 · 趋势记录"]
+    ACCEPT --> HEART["心跳/等待判断"]
+    CHK -- "无变化" --> HEART
+    SKIP --> LOOP
+    CHKX --> LOOP
+
+    HEART{"轮到谁?"}
+    HEART -- "轮到对方" --> WAIT["等待: 每4s横幅轮询<br/>双读确认切换<br/>横幅不可读→继续等"]
+    WAIT --> LOOP
+    HEART -- "轮到我方" --> CAP{"提子动画<br/>稳定重读"}
+    CAP -- "不一致" --> LOOP
+    CAP -- "一致" --> GATE{"行动前横幅闸门"}
+    GATE -- "横幅确认" --> ANALYZE["引擎分析<br/>预分析缓存命中→零等待<br/>否则按等待时长阶梯算力"]
+    GATE -- "不可读 &lt;20s" --> GATE
+    GATE -- "不可读 ≥20s" --> BYPASS["按落子推算谨慎落子<br/>点错会被校验拦截"]
+    BYPASS --> ANALYZE
+    GATE -- "横幅≠推算 且刚落子&lt;3s" --> ANALYZE
+    ANALYZE --> MVCHK{"着法在网格内<br/>且目标为空?"}
+    MVCHK -- "否" --> RECHOOSE["清缓存重识别<br/>或改选他处"]
+    RECHOOSE --> ANALYZE
+    MVCHK -- "是" --> REREAD["点击前重读<br/>失败快速重试3次"]
+    REREAD --> CLICK["PostMessage 点击<br/>每次现找渲染窗口"]
+    CLICK --> VERIFY{"落子验证<br/>阶梯轮询 ≤4 次"}
+    VERIFY -- "成功" --> DONE["更新状态 · 趋势记录<br/>SGF 滚动保存"]
+    VERIFY -- "失败" --> FAIL1{"劫争/连续失败?"}
+    FAIL1 -- "否" --> MVCHK
+    FAIL1 -- "是" --> BLACKLIST["加入黑名单改选<br/>8s轮 · 清缓存"]
+    BLACKLIST --> FAILCAP{"超过上限?"}
+    FAILCAP -- "否" --> ANALYZE
+    FAILCAP -- "是" --> ENDGATE
+    DONE --> LOOP
+
+    PASS{"引擎建议停一手"}
+    PASS -- "胜率≥98% 或盘面下满" --> JUDGE["点智能裁判+确认"]
+    PASS -- "90-98%" --> OWN{"ownership 盘面定型检查"}
+    OWN -- "定型" --> JUDGE
+    OWN -- "未定型" --> KEEPGO["不采纳继续下"]
+    KEEPGO --> LOOP
+    JUDGE --> SETTLE["等结算"]
+    SETTLE --> ENDGATE
+
+    ENDGATE(["终局出口 end_or_wait"]) --> SGFSAVE["存时间戳 SGF"]
+    SGFSAVE --> NEXT{"--wait-new?"}
+    NEXT -- "否" --> STOP(["停止"])
+    NEXT -- "是" --> REMATCH["等结算页 → 点重新匹配<br/>≤10 分钟"]
+    REMATCH --> NEWGAME{"检测到新局?"}
+    NEWGAME -- "超时" --> STOP
+    NEWGAME -- "是" --> RESET["清 SGF/趋势状态"]
+    RESET --> NEWID["新局: 角标核对执色<br/>分先换色自动切换<br/>黑先观察/白等待"]
+    NEWID --> LOOP
+</div>
+
+<div class="legend">
+  <b>四个数据源分工:</b><br>
+  · <b>执色</b> = 头像角标棋子颜色(唯一依据, 读不到就停/人工指定)<br>
+  · <b>轮次</b> = 横幅为真值; 落子瞬间靠"谁刚落子→轮到对方"算术即时翻转, 横幅只做校准<br>
+  · <b>网格/尺寸</b> = 自动检测, 变化需双读确认<br>
+  · <b>人工介入点</b> = 启动识别失败(UI 对话框) / 行动前横幅长期不可读(按推算谨慎落子) / 连续失败出口
+</div>
+
+<script src="mermaid.min.js"></script>
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'loose' });
+</script>
+</body>
+</html>
