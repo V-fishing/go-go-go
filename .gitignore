@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+.idea/
+.vscode/
+
+# 运行期产物：截图帧 / 分析日志 / 缓存
+frames/
+analysis_logs/
+*.log
+*.npz
+*.npy
+*.jsonl
