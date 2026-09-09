@@ -928,9 +928,9 @@ def turn_arrow_geo(rect, grid=None, arr=None):
     右=对方)。我方行棋(箭头左)时楔形块顶入圆环左缘(绿框条带内);
     对方行棋(箭头右)时楔形在右缘外, 徽章区仅弧与文字笔画。
     在窗口上部固定区(xc±45, y60-280)定位圆环主体(与棋盘路数无关),
-    取中段列投影: 宽列>=4 且橙量>=25 -> 楔形在框 -> 'mine';
-    宽列<=2 -> 仅弧 -> 'opp'; 中间 -> None。
-    返回 'mine'/'opp'/None。"""
+    取中段列投影: 宽列>=4 且橙量>=25 -> 楔形在框 -> 'white'(白方行棋);
+    宽列<=2 -> 仅弧 -> 'black'(黑方行棋); 中间 -> None。
+    返回 'white'/'black'/None(行棋方颜色, 非 mine/opp)。"""
     try:
         import numpy as np
         if arr is None:
@@ -955,9 +955,9 @@ def turn_arrow_geo(rect, grid=None, arr=None):
         wide_cols = int((midsum >= 5).sum())
         mx = int(midsum.sum())
         if wide_cols >= 4 and mx >= 25:
-            return 'mine'    # 楔形 = 箭头左 = 我方行棋
+            return 'white'   # 楔形 = 箭头左 = 白方行棋(真值图语义)
         if wide_cols <= 2:
-            return 'opp'     # 仅弧 = 箭头右 = 对方行棋
+            return 'black'   # 仅弧 = 箭头右 = 黑方行棋
         return None
     except Exception:
         return None

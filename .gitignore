@@ -20,3 +20,5 @@ grid_calib.json
 
 # AI 协作内部文件
 CLAUDE.md
+ui_state.json
+ui_state.json.tmp

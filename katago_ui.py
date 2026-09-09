@@ -22,6 +22,7 @@ import winclick
 
 PY = sys.executable
 LOG = os.path.join(TOOLS, 'katago_ui.log')
+STATE = os.path.join(TOOLS, 'ui_state.json')   # 主进程状态投影文件
 BTN_KEYS = ('智能裁判', '裁判', '停一手', '虚着', '认输', '数子', '形势判断',
             '悔棋', '提示', '确定', '确认', '取消', '重新匹配', '续战',
             '再来一局', '继续', '返回', '是', '否')
@@ -175,6 +176,11 @@ class KatagoUI:
         self.trend_cv.pack(fill='x')
         right = tk.Frame(main)
         right.pack(side='right', fill='both', expand=True, padx=(10, 0))
+        self.state_lab = tk.Label(
+            right, justify='left', anchor='w', wraplength=470,
+            font=('Microsoft YaHei', 10), fg='#0a3d62',
+            text='状态投影: 启动后显示 执子/轮次/手数/黑白/胜率')
+        self.state_lab.pack(fill='x', pady=(0, 4))
         self.board_cv = tk.Canvas(right, width=440, height=440,
                                   bg='#f0ead6')
         self.board_cv.pack(fill='both', expand=True)
@@ -224,6 +230,76 @@ class KatagoUI:
         except Exception:
             return res
 
+    def poll_state(self):
+        """轮询主进程状态投影文件 ui_state.json -> ('state', dict|None)"""
+        import threading as _th
+
+        def worker():
+            try:
+                with open(STATE, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+                self._q.put(('state', d))
+            except Exception:
+                self._q.put(('state', None))
+        _th.Thread(target=worker, daemon=True).start()
+
+    def _fmt_state(self, d):
+        """状态投影一行文案: 局/执子/轮次/路数/手数/黑白/胜率/引擎"""
+        p = []
+        game = d.get('game') or 0
+        assist = d.get('assist')
+        turn = d.get('turn')
+        n = d.get('n') or 0
+        b = d.get('b', 0)
+        w = d.get('w', 0)
+        p.append('第%d盘' % game if game else '对局')
+        p.append('执%s' % ('黑' if assist == 'black'
+                           else ('白' if assist == 'white' else '?')))
+        if turn == 'black':
+            t = '轮到黑'
+        elif turn == 'white':
+            t = '轮到白'
+        else:
+            t = '轮次?'
+        if assist:
+            t += '(我方)' if turn == assist else '(对方)'
+        p.append(t)
+        if n:
+            p.append('%d路' % n)
+        p.append('黑%d 白%d' % (b, w))
+        if d.get('move_no'):
+            p.append('第%d手' % d['move_no'])
+        wr = d.get('wr')
+        if wr is not None:
+            lead = d.get('lead')
+            ls = (' 目差%+.1f' % lead) if lead is not None else ''
+            p.append('胜率%.1f%%%s' % (wr * 100, ls))
+        if d.get('mv'):
+            p.append('推荐%s' % d['mv'])
+        src = d.get('turn_src')
+        if src:
+            mp = {'visual': '视觉', 'empty': '空盘', 'parity': '奇偶',
+                  'manual': '手动', 'unresolved': '未定'}
+            p.append('锚定:%s' % mp.get(src, src))
+        st = d.get('status')
+        if st:
+            sm = {'boot': '启动中', 'wait': '等待', 'analyze': '分析中',
+                  'clicked': '已落子', 'fail': '落子失败',
+                  'gameover': '终局', 'new': '新局'}
+            p.append(sm.get(st, st))
+        return ' | '.join(p)
+
+    def _state_result(self, d):
+        try:
+            if d is None:
+                self.state_lab.config(
+                    text='状态投影: 未启动(启动自动落子后显示)',
+                    fg='#999999')
+                return
+            self.state_lab.config(text=self._fmt_state(d), fg='#0a3d62')
+        except Exception:
+            pass
+
     def poll_board(self):
         if self._board_busy:
             self.root.after(800, self.poll_board)
@@ -258,6 +334,8 @@ class KatagoUI:
                 kind, payload = self._q.get_nowait()
                 if kind == 'board':
                     self._board_result(payload)
+                elif kind == 'state':
+                    self._state_result(payload)
                 else:
                     self._buttons_result(payload)
         except Exception:
@@ -268,6 +346,7 @@ class KatagoUI:
             self.root.after(delay, self.poll_board)
         if not self._btn_busy:
             self.root.after(2000, self.poll_buttons)
+        self.root.after(600, self.poll_state)
         self.root.after(300, self._drain_q)
 
     def _board_result(self, res):
@@ -716,6 +795,8 @@ class KatagoUI:
             self.proc = None
             self.write_log('\n[已手动停止]\n')
             self.set_running(False)
+            self.state_lab.config(
+                text='状态投影: 已停止', fg='#999999')
         try:
             subprocess.run(['taskkill', '/IM', 'katago.exe', '/F'],
                            capture_output=True,

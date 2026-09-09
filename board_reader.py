@@ -696,6 +696,7 @@ def classify_px(px):
 
 _prev_board = None
 _flog = [0.0]   # 闪动诊断打印节流
+_top_bad = 0    # 首行异常连续帧计数: 单帧(动画瞬态)只丢不缓存, 连续2帧才清缓存
 
 
 def _flash_check(a, xs, ys, stone_r, board):
@@ -747,33 +748,31 @@ def _flash_check(a, xs, ys, stone_r, board):
                 return
 
 
-_QD_CACHE = {}   # stone_r -> (全盘偏移, 内核偏移, 环带偏移)
+_QD_CACHE = {}   # stone_r -> 左上四分之一内芯偏移
 
 
 def _quarter_disk(stone_r):
-    """左上四分之一圆盘采样模板(含 内核对 与 外环带):
-    全盘: 半径 stone_r, 左上象限(最后一手标记在右下, 永不入样);
-    内核: 0.45r(棋子中心/方块中心/星位点均含);
-    环带: 0.55r~0.95r(真圆棋子半径>9px 覆盖环带; 悬停预览方块仅
-          ~5px 半径 → 环带为木色)。环带是"圆(真子) vs 方(预览块)"
-          形状直读判据, 用户真值图实测: 子=18-23px 圆, 方块=10-12px。"""
+    """左上四分之一内芯采样(半径 0.55r)。
+    最后一手标记 + 光晕是**全环描边/呼吸**(黑子白描边、白子黑描边,
+    占 0.8-1.0r 外缘, 实测动画帧可顶破占比阈值), 内芯远离外缘不受
+    影响; 悬停方块(12px)/星位点由宽度直读(>=15px)排除。"""
     if stone_r in _QD_CACHE:
         return _QD_CACHE[stone_r]
-    offs, cores, ring = [], [], []
-    r2 = stone_r * stone_r
-    r2c = int((stone_r * 0.45) ** 2)
-    r2a = int((stone_r * 0.55) ** 2)
-    r2b = int((stone_r * 0.95) ** 2)
-    for dy in range(-stone_r, 1):
-        for dx in range(-stone_r, 1):
-            dd = dy * dy + dx * dx
-            if dd <= r2:
+    offs = []
+    # 采样芯定位在棋子"左上角区域": 以交点左上侧 0.55r 处为中心的小圆
+    # (半径 0.3r)。棋体覆盖 0-0.8r, 芯远离网格十字轴(不入采样)且远离
+    # 最后手标记/光晕外环(0.8-1.0r 全环描边), 只在纯子色区采样。
+    # 采样芯定位在棋子左上角区域(偏移 0.68*stone_r 的左上方向):
+    # 距圆心约 0.96*stone_r, 子半径≈1.25*stone_r -> 仍在子体内且
+    # 在标记/光晕内缘(0.85 倍子半径)之外
+    c = -max(3, round(stone_r * 0.68))
+    rr = max(2, round(stone_r * 0.28))
+    r2 = rr * rr
+    for dy in range(c - rr, c + rr + 1):
+        for dx in range(c - rr, c + rr + 1):
+            if (dy - c) ** 2 + (dx - c) ** 2 <= r2:
                 offs.append((dy, dx))
-                if dd <= r2c:
-                    cores.append((dy, dx))
-                elif r2a <= dd <= r2b:
-                    ring.append((dy, dx))
-    _QD_CACHE[stone_r] = (offs, cores, ring)
+    _QD_CACHE[stone_r] = offs
     return _QD_CACHE[stone_r]
 
 
@@ -787,7 +786,7 @@ def read_board(a, xs, ys, stone_r):
     offs = _quarter_disk(stone_r)
     if not offs or len(offs) < 2:
         return ['.' * n for _ in range(n)]
-    offs_all, offs_core, offs_ring = offs
+    offs_all = offs
 
     def stats(offlist):
         dy_o = np.array([o[0] for o in offlist], int)
@@ -807,50 +806,61 @@ def read_board(a, xs, ys, stone_r):
         return bf, wf, nv
 
     bf, wf, nv = stats(offs_all)
-    X = (bf > 0.45) & (wf < 0.30)
-    O = (wf > 0.35) & (bf < 0.30)
-    # 形状直读(尺寸): 过交叉点水平线上 同色连续"宽度":
-    #   真圆棋子直径 18-20px(宽>=15); 悬停预览方块 12px(宽<15);
-    #   星位小点 4-6px。宽 <15 的判 X/O 候选一律视为方块/星点。
-    # 用户真值图实测: 子=18-23px 圆, 预览方块=10-12px 方。
+    # 互斥门槛 0.45: 最后一手对色标记+光晕会渗入左上采样区(实测暗/亮
+    # 占比可到 0.34), 0.30 会把光晕期真子误读丢; 真子对色占比 <0.15
+    X = (bf > 0.45) & (wf < 0.45)
+    O = (wf > 0.35) & (bf < 0.45)
+    # 形状直读(左半边/上段宽度): 量半段内"最长同色连续段"——
+    # 不要求从交点中心起算: 最后一手反色三角(白三角盖黑子)尖角过棋心
+    # 会把中心像素染成中间调(非黑非白), 从中心起算的逻辑连测都不测,
+    # 带标记真子整格读空; 而子体在中心对侧仍有 >=8px 纯色连续段,
+    # 最长段 >=8 依然是真子铁证:
+    #   真子 ≈9-12px(直径 18-23); 悬停方块 12px -> 左半 6px; 星位 4-6px
+    # 判据: 左半段或上段最长同色连续 >=8px -> 真子; 排除方块/星点。
     step = float(np.mean([xs[1] - xs[0], ys[1] - ys[0]]))
     hw = int(min(W - 1, max(6, step * 0.52)))
     iy = np.round(np.asarray(ys, float)).astype(int)
     ix = np.round(np.asarray(xs, float)).astype(int)
-    R2 = a[:, :, 0].astype(int)
-    G2 = a[:, :, 1].astype(int)
-    B2 = a[:, :, 2].astype(int)
     lum2 = a.mean(axis=2)
     chm2 = a.max(axis=2) - a.min(axis=2)
     blk = (lum2 < 105) & (chm2 < 30)
     wht = (lum2 > 165) & (chm2 < 60)
-    runw = np.zeros((n, n), int)
+
+    def _best_run(seg):
+        best = cur = 0
+        for v in seg:
+            cur = cur + 1 if v else 0
+            if cur > best:
+                best = cur
+        return best
+
+    runbw = np.zeros((n, n), int)   # 左半段最长黑连续
+    runww = np.zeros((n, n), int)   # 左半段最长白连续
+    runbv = np.zeros((n, n), int)   # 上段最长黑连续
+    runwv = np.zeros((n, n), int)   # 上段最长白连续
     for i in range(n):
         yy = iy[i]
-        lr = lum2[yy]
-        bc = blk[yy]
-        wc = wht[yy]
+        yl = max(0, yy - hw)
         for j in range(n):
             xx = ix[j]
-            xl, xr_ = max(0, xx - hw), min(W, xx + hw + 1)
-            if not bc[xl:xr_].any() and not wc[xl:xr_].any():
-                continue
-            # 从中心向左右扩展连续同色段
-            tgt = 'b' if bc[xx] else ('w' if wc[xx] else None)
-            if tgt is None:
-                continue
-            msk = bc if tgt == 'b' else wc
-            L = 0
-            while xx - L > xl and msk[xx - L - 1]:
-                L += 1
-            Rr = 0
-            while xx + Rr < xr_ - 1 and msk[xx + Rr + 1]:
-                Rr += 1
-            runw[i, j] = L + Rr + 1
-    small = runw > 0
-    X = X & (~small | (runw >= 15))
-    O = O & (~small | (runw >= 15))
-    grid = np.where(nv < 8, '?', np.where(X, 'X', np.where(O, 'O', '.')))
+            xl = max(0, xx - hw)
+            runbw[i, j] = _best_run(blk[yy, xl:xx + 1])
+            runww[i, j] = _best_run(wht[yy, xl:xx + 1])
+            runbv[i, j] = _best_run(blk[yl:yy + 1, xx])
+            runwv[i, j] = _best_run(wht[yl:yy + 1, xx])
+    # 半段直读可独立成立(与芯判定 OR): 网格交点与子心错位/漂移时,
+    # 采样芯可能偏出子体, 但左/上 半段最长同色连续 >=8px 仍是真子证据;
+    # 悬停方块(6px)/星位点(2-3px)在半段上依然 <8 被排除
+    cen_b = blk[iy, ix]
+    cen_w = wht[iy, ix]
+    halfb = (runbw >= 8) | (runbv >= 8)
+    halfw = (runww >= 8) | (runwv >= 8)
+    # 芯判子须 AND 相应色半段>=8(方块: 芯判黑但半段仅6px -> 排除);
+    # 半段+中心同色 独立 OR 兜底(错位子: 芯偏出体, 半段仍纯子色)
+    X = (X & halfb) | (halfb & cen_b & (wf < 0.45))
+    O = (O & halfw) | (halfw & cen_w & (bf < 0.45))
+    # 内芯(离轴)19路仅 4 采样点, nv 下限 3 即足够占比统计
+    grid = np.where(nv < 3, '?', np.where(X, 'X', np.where(O, 'O', '.')))
     board = [''.join(r) for r in grid.tolist()]
     _flash_check(a, xs, ys, stone_r, board)
     return board
@@ -904,12 +914,22 @@ _chk_cnt = 0
 _size_hint = 0
 _grid_cache = {}  # (winW,winH) -> [(xs,ys,n,src), ...] 最多2份
 _align_cache = {}   # (winW, vis_h, n) -> (已对齐 xs, ys): 自适应对齐缓存
+_grid_lock = {}     # (winW, vis_h, n) -> 冻结网格(xs, ys): 静止窗口下
+                    # 坐标完全锁定, 防逐帧 refine 微抖跨采样边界
 _align_cnt = 0      # 对齐帧计数(每 25 次强制重对齐一次, 防慢漂移)
 
 
 def clear_grid_cache():
     _grid_cache.clear()
     _align_cache.clear()
+    _grid_lock.clear()
+
+
+def align_reset():
+    """仅重置对齐/冻结缓存(保留网格缓存): 疑似网格错位时强制下次
+    重新对齐, 但保留线检测兜底, 不会退化成清缓存后永久读不到。"""
+    _align_cache.clear()
+    _grid_lock.clear()
 
 
 def read_current(use_calib=False, force_auto=False, do_align=True,
@@ -1036,6 +1056,20 @@ def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
                                      np.array(ys, float))
 
     xs, ys, drift = refine_grid(a, xs, ys)
+    # ---- 网格冻结: 静止窗口下坐标完全锁定(防逐帧 refine 微抖把采样芯
+    # 跨过棋子边缘/光晕带); 检测到真实移动(均差>1.5px)才更新锁定 ----
+    _lk = _grid_lock.get((rect[2] - rect[0], vis_h, len(xs)))
+    if _lk is not None and len(_lk[0]) == len(xs):
+        _dxk = float(np.mean(np.abs(np.asarray(xs, float) - _lk[0])))
+        _dyk = float(np.mean(np.abs(np.asarray(ys, float) - _lk[1])))
+        if (_dxk + _dyk) / 2 <= 1.5:
+            xs, ys = _lk[0], _lk[1]   # 冻结: 复用锁定网格
+        else:
+            _grid_lock[(rect[2] - rect[0], vis_h, len(xs))] = (
+                np.array(xs, float), np.array(ys, float))
+    else:
+        _grid_lock[(rect[2] - rect[0], vis_h, len(xs))] = (
+            np.array(xs, float), np.array(ys, float))
     if not board_visible(a, xs, ys):
         # 对齐把网格推到不可见位置(密集盘面下方差对齐偶发偏 ~4px, 导致
         # 整读失败 = UI 周期性闪烁/play 周期掉读): 回退到对齐前网格
@@ -1051,6 +1085,22 @@ def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
     step = float(np.mean([xs[1] - xs[0], ys[1] - ys[0]]))
     stone_r = max(6, min(40, int(step * 0.32)))
     board = read_board(a, xs, ys, stone_r)
+    # 首行异常防护: 棋盘首行(靠边)几乎不会同时落 6+ 子; 一行子里
+    # >=6 且大部分是同一色 = 网格首行被锚到棋盘上沿以外的 UI 点阵
+    # (头像圆点/段位/计时等白色元素) -> 整帧丢弃并清网格缓存,
+    # 防幻影盘面污染 UI 镜像与对局基准。
+    # 单帧(动画/UI瞬态)只丢帧不清缓存——密集盘面依赖缓存兜底做
+    # 线路检测, 一次性清空会"闪动一帧后永久读不到"; 连续2帧异常
+    # (真幻影锚定)才清缓存并强制重定位。
+    global _top_bad
+    _top = board[0]
+    _top_n = sum(1 for c in _top if c in 'XO')
+    if _top_n >= 6:
+        _top_bad += 1
+        if _top_bad >= 2:
+            clear_grid_cache()
+        return None
+    _top_bad = 0
     key = (rect[2] - rect[0], vis_h)
     entry = (np.array(xs), np.array(ys), n, src)
     entries = [e for e in _grid_cache.get(key, [])

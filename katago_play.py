@@ -5,7 +5,7 @@
 用法:
     python katago_play.py white --turn white   # 执白, 当前轮到白(立即下)
     python katago_play.py white --turn black   # 执白, 当前轮到黑(等AI下完再下)
-    (不传 --turn 时按子数奇偶猜, 不准时请显式指定)
+    (不传 --turn 时按绿框行棋横幅判定, 不可判时停车请人工指定)
 
 状态机:
     轮次只在两类事件翻转: ①确认到盘面变化(有人落子) ②自己成功落子。
@@ -184,6 +184,59 @@ def cursor_hovers_board():
 
 
 
+def _other(c):
+    """执色反转: 白->黑, 黑->白"""
+    return 'black' if c == 'white' else 'white'
+
+
+
+# ---------------- UI 状态投影 ----------------
+# 主进程把关键状态(执子/轮次/手数/黑白/胜率/锚定来源/引擎状态)原子写入
+# ui_state.json, katago_ui.py 轮询展示。节流 1s, 关键事件 force=True 立即。
+_UI_ST = {'game': 0, 'assist': None, 'turn': None, 'turn_src': None,
+          'n': 0, 'b': 0, 'w': 0, 'move_no': 0, 'wr': None, 'lead': None,
+          'status': 'boot', 'mv': '', 'engine': ''}
+_UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'ui_state.json')
+_UI_LOCK = threading.Lock()
+_UI_PUB_AT = [0.0]
+_EVT = [None]      # 步进计时: 关键事件间隔诊断(定位"20s一手"花在哪)
+
+
+def evt(msg):
+    """关键步进日志: 打印距上一关键事件的间隔(诊断管道耗时)。"""
+    try:
+        _now = time.time()
+        _d = (_now - _EVT[0]) if _EVT[0] else 0.0
+        _EVT[0] = _now
+        print(f'[步进+{_d:.1f}s] {msg}')
+    except Exception:
+        pass
+
+
+
+def ui_pub(force=False):
+    """写状态文件(临时文件+os.replace 原子替换, 防 UI 读到半截)。"""
+    try:
+        now = time.time()
+        if not force and now - _UI_PUB_AT[0] < 1.0:
+            return
+        _UI_PUB_AT[0] = now
+        _UI_ST['ts'] = now
+        with _UI_LOCK:
+            _tmp = _UI_PATH + '.tmp'
+            with open(_tmp, 'w', encoding='utf-8') as _f:
+                json.dump(_UI_ST, _f, ensure_ascii=False)
+            os.replace(_tmp, _UI_PATH)
+    except Exception:
+        pass
+
+
+def _set_st(force=False, **kw):
+    _UI_ST.update(kw)
+    ui_pub(force)
+
+
 def vis_learn(cls, frac):
     """可信时刻(算术锁定回合)更新绿框两态参考"""
     if frac is None:
@@ -218,8 +271,10 @@ def vis_classify(frac):
 
 
 def visual_turn(res_cur, rect=None):
-    """视觉行棋判定(异+自学习主判; 稳定版, 楔形几何仅日志不参与判定)。
-    返回 ('obox', 'mine'/'opp'/None, 描述)。"""
+    """视觉行棋判定: 徽章几何(官方真值: 楔形=白方行棋/仅弧=黑方行棋,
+    无需学习)优先; 异+自学习兜底(obox)。
+    返回 (src, val, 描述): 'geo' -> val='white'/'black'(行棋方颜色);
+    'obox' -> val='mine'/'opp'(相对我方); None -> 不确定。"""
     try:
         if res_cur is None:
             return None, None, ''
@@ -230,6 +285,10 @@ def visual_turn(res_cur, rect=None):
             _arr = _np.asarray(_im).astype(_np.int16)
         _rect = rect or res_cur.get('rect')
         _grd = res_cur if (res_cur and 'ys' in res_cur) else None
+        _g = winclick.turn_arrow_geo(_rect, _grd, _arr)
+        if _g in ('white', 'black'):
+            return 'geo', _g, ('徽章:%s方行棋' %
+                               ('白' if _g == 'white' else '黑'))
         _st = winclick.strip_box_stats(_rect, _grd, _arr)
         if _st is not None:
             _vc = vis_classify(_st[0])
@@ -242,11 +301,15 @@ def visual_turn(res_cur, rect=None):
 
 
 def anchor_turn_visual(counts, assist, res_cur):
-    """启动锚定: 绿框视觉判定优先(两态参考已学习时最可靠), 奇偶兜底。
+    """启动锚定: 绿框视觉判定为唯一依据——盘中提子使子数差失真,
+    奇偶无意义, 只在绿框里找答案。优先级: ①官方徽章几何(楔形=白方
+    行棋/仅弧=黑方行棋, 语义直接, 无需学习) ②异值两态参考/固定阈值。
     空盘是铁律: 黑先手必轮到黑(与我方执色无关), 直接锚定并顺带把绿框
-    两态参考学到(从第一局首秒起自适应布局, 消除冷启动误判)。
-    锚定不写入参考(首判可能受固定阈值误导); 参考只在算术锁定的可信
-    时刻学习。返回 (turn, 'visual-geo'/'visual'/'parity'/'empty')。"""
+    两态参考学到(从第一局首秒起自适应布局, 消除冷启动误判)。锚定不
+    写入参考(首判可能受固定阈值误导); 参考只在算术锁定的可信时刻学习。
+    绿框不可判时重试(横幅动画/遮挡是瞬态的), 仍不可判返回
+    (None, 'unresolved')——不猜, 交人工。
+    返回 (turn, 'visual'/'empty'/'unresolved')。"""
     if counts[0] + counts[1] == 0:
         # 空盘: 必轮到黑; 此刻轮次是算术铁律, 绿框采样即该态的真值
         try:
@@ -267,24 +330,47 @@ def anchor_turn_visual(counts, assist, res_cur):
         except Exception:
             pass
         return 'black', 'empty'
-    # 视觉判定: 异+自学习(主判)
+    # 绿框视觉判定: 冷启动参考未学时按固定阈值直判(异≤0.12我方 /
+    # ≥0.14对方), 参考学会后改走两态中点分界; 不可判则重试再放弃
     try:
         _rw = br.window_rect(br.PID)
-        _src, _res, _info = visual_turn(res_cur, _rw)
-        if _src == 'obox' and _res in ('mine', 'opp'):
-            _frac = _info.split('异')[1]
-            print(f'  绿框状态: 异{_frac} | '
-                  f'参考: 我方{_VIS_REF["mine"]} 对方{_VIS_REF["opp"]} '
-                  f'-> {"我方" if _res=="mine" else "对方"}行棋')
-            return (assist if _res == 'mine' else _other(assist)), 'visual'
     except Exception:
-        pass
-    b, w = counts
-    _t = 'white' if b > w else 'black'
-    if b + w > 0 and abs(b - w) > 1:
-        print('!! 盘面黑白差>1(含提子痕迹), 奇偶兜底不可靠; '
-              '若轮次不对请用 UI 手动指定后重启')
-    return _t, 'parity'
+        _rw = None
+    _grd = res_cur if (res_cur and 'ys' in res_cur) else None
+    for _i in range(4):
+        try:
+            _arr = None
+            _im = res_cur.get('img') if res_cur else None
+            if _im is not None:
+                import numpy as _np
+                _arr = _np.asarray(_im).astype(_np.int16)
+            # 官方魔章几何优先: 楔形=白方行棋/仅弧=黑方行棋, 语义直接
+            _g = winclick.turn_arrow_geo(_rw, _grd, _arr)
+            if _g in ('white', 'black'):
+                print(f'  绿框徽章: {"白方" if _g=="white" else "黑方"}行棋'
+                      f'(官方真值) -> 轮到'
+                      f'{"白" if _g=="white" else "黑"}')
+                return _g, 'visual'
+            _st = winclick.strip_box_stats(_rw, _grd, _arr)
+            if _st is not None:
+                _vc = vis_classify(_st[0])
+                if _vc in ('mine', 'opp'):
+                    _learned = (_VIS_REF['mine'] is not None
+                                and _VIS_REF['opp'] is not None)
+                    _lab = (f'参考: 我方{_VIS_REF["mine"]:.2f} '
+                            f'对方{_VIS_REF["opp"]:.2f}' if _learned
+                            else '参考未学习(冷启动), 固定阈值直判')
+                    print(f'  绿框状态: 异{_st[0]:.2f} | {_lab} -> '
+                          f'{"我方" if _vc=="mine" else "对方"}行棋')
+                    return (assist if _vc == 'mine'
+                            else _other(assist)), 'visual'
+        except Exception:
+            pass
+        time.sleep(0.6)
+    print('?? 绿框状态连续无法判定(读数失败或异值落在死区), 不猜奇偶;')
+    print('   请确认微信窗口在前台且处于对局页, 在 UI 里选[当前轮到]后'
+          '点[启动]重试')
+    return None, 'unresolved'
 
 
 
@@ -349,7 +435,9 @@ def analyze_position(n, stones, player, visits=None, banned=None):
         'boardXSize': n, 'boardYSize': n, 'analyzeTurns': [0],
         'maxVisits': visits,
     }
+    _t0 = time.time()
     d = CLIENT.query(req)
+    evt('引擎返回(%.1fs, %d点)' % (time.time() - _t0, visits))
     if d is None:
         return None, None, None
     mis = d.get('moveInfos', [])
@@ -393,8 +481,11 @@ def pre_analyze(n, board, assist, wait):
     (350 -> 800 -> 2000 -> 满配), 轮到我们时直接采用近满强度结果。
     只影响速度不影响正确性: 盘面键不匹配/含劫争黑名单时主流程重新完整分析。"""
     global PRE
-    lvl_at = (3, 8, 16, 28)             # 等待秒数阈值(自对方落子起)
-    lvl_visits = (PRE_VISITS, 800, 2000, VISITS)
+    # 预分析上限封顶 2000: 全量 8000 会与主查询排队(单引擎串行),
+    # 本机并行时吞吐 ~500 v/s, 排队双 8000 = 15-21s/手;
+    # 预分析只做预判, 定局强度由我方回合的主查询 8000 保证
+    lvl_at = (2, 5, 10)             # 等待秒数阈值(自对方落子起)
+    lvl_visits = (PRE_VISITS, 800, 2000)
     lvl = 0
     for i, t in enumerate(lvl_at):
         if wait >= t:
@@ -686,6 +777,7 @@ def end_or_wait(msg):
     """终局/异常出口: 打印原因; wait_new 模式下自动点[重新匹配/续战]进入下一盘,
     返回新局读数 (n,board,counts,res); 否则返回 None(停止)。"""
     global AUTO_NEXT, GAMES_DONE, GAME_MOVES, GAME_LAST_KEY, CAP_HOLD
+    _set_st(force=True, status='gameover', mv=msg[:40])
     print(msg)
     beep()
     save_game_sgf(final=True, reason=msg[:50])
@@ -714,6 +806,8 @@ def end_or_wait(msg):
                 print(f'!! 已达设定局数上限({MAX_GAMES}盘), 停止')
                 return None
             print(f'检测到新局(第{GAMES_DONE}盘), 继续')
+            _set_st(force=True, game=GAMES_DONE, status='new',
+                    move_no=0, mv='', wr=None, lead=None)
             return g
         # 2) OCR 找 [重新匹配] 按钮并点击(每 ~6s 一次, 最多试 10 次)
         now = time.time()
@@ -784,6 +878,41 @@ def scan_popups():
 
 
 
+def click_target_profile(res, i, col):
+    """点击目标点邻域剖面: 返回 (暗占比, 彩占比, 亮占比, 均亮) 或 None。
+    剖面按 res 的网格坐标采样(与读盘同一坐标系)。
+    引擎读空但暗占比>=0.35 且亮占比低 => 该点视觉上有子,
+    疑似读盘漏子/网格错位(点已有子的点会被客户端静默忽略)。"""
+    try:
+        import numpy as _np
+        if res is None:
+            return None
+        im = res.get('img')
+        if im is not None:
+            a = _np.asarray(im).astype(int)
+        else:
+            from PIL import ImageGrab
+            a = _np.asarray(
+                ImageGrab.grab(bbox=res['rect']).convert('RGB')).astype(int)
+        xs, ys = res['xs'], res['ys']
+        if i >= len(ys) or col >= len(xs):
+            return None
+        gx, gy = int(xs[col]), int(ys[i])
+        _h = max(6, int(res.get('step', 27) * 0.55))
+        c = a[gy - _h:gy + _h + 1, gx - _h:gx + _h + 1]
+        if c.size == 0:
+            return None
+        chm = c.max(axis=2) - c.min(axis=2)
+        lum = c.mean(axis=2)
+        df = float(((lum < 92) & (chm < 60)).mean())
+        bf = float(((lum > 238) & (chm < 40)).mean())
+        cf = float((chm > 60).mean())
+        return df, cf, bf, float(lum.mean())
+    except Exception:
+        return None
+
+
+
 
 def read_board_counts():
     """读盘(悬停防护): 路数由网格自动检测决定(OCR 标题偶发误读会在缓存
@@ -840,7 +969,8 @@ GAME_MOVES = []       # 本局着法(终局写 SGF): {'no','c'(X/O),'mv','n',+bw
 GAME_LAST_KEY = None  # 已记录着法后的盘面键(防同手重复记录)
 LAST_BOARD = None     # 上一已确认盘面(推算对方落点)
 CAP_HOLD = 0.0        # 最近一次含提子的变化接受时刻(动画稳定窗口)
-SETTLE_S = 1.0        # 稳定窗口: 该时段内提交分析前须重读一次盘核对
+SETTLE_S = 0.6        # 稳定窗口: 该时段内提交分析前须重读一次盘核对
+                      # (重读确认稳定即继续, 不再卡满整窗)
 
 
 def ocr_window_text():
@@ -956,6 +1086,18 @@ def main():
         return
 
     print('读取初始盘面(稳定化中)...')
+    # 弹窗自动应答(3s 节流): 求和/数子/认输弹窗在启动阶段同样会盖住
+    # 棋盘, 主循环有应答、稳定化/wait-new 阶段此前没有, 会被干等 30s
+    _pop_last = [0.0]
+
+    def _pop_scan():
+        if time.time() - _pop_last[0] > 3.0:
+            _pop_last[0] = time.time()
+            try:
+                scan_popups()
+            except Exception:
+                pass
+
     init = None
     for _try in range(15):
         try:
@@ -968,6 +1110,7 @@ def main():
             _d1 = '异常:%s' % _e1
         if g1 is None:
             time.sleep(0.4)
+            _pop_scan()   # 弹窗可能正盖住棋盘
             continue
         time.sleep(0.25)
         try:
@@ -980,11 +1123,13 @@ def main():
             _d2 = '异常:%s' % _e2
         if g2 is None:
             time.sleep(0.4)
+            _pop_scan()
             print('  稳定化#%d: 第%d读=None (%s) 第%d读=None (%s), 重试' %
                   (_try + 1, 1, _d1, 2, _d2))
             continue
         if g2[2] != g1[2]:
             time.sleep(0.4)
+            _pop_scan()
             print('  稳定化#%d: 两次计数不一致 %s vs %s, 重试' %
                   (_try + 1, _d1, _d2))
             continue
@@ -1004,6 +1149,7 @@ def main():
             deadline = time.time() + 600
             while time.time() < deadline:
                 time.sleep(2)
+                _pop_scan()   # 待机时弹窗(求和/数子/结算提示)自动应答
                 g1 = read_board_counts()
                 if g1 is None:
                     continue
@@ -1038,7 +1184,7 @@ def main():
             assist = av
             print(f'执子识别(头像角标颜色): 我方执'
                   f'{("黑" if assist=="black" else "白")}')
-            turn = None     # 启动锚定: 子数奇偶推算(黑先手)
+            turn = None     # 启动锚定: 绿框视觉判定(唯一依据)
         else:
             # 执色只认头像角标(名字行的 黑方/白方 是行棋指示文字, 非持子标记,
             # 轮到对方时它会显示对方颜色, 不能用于判我方执色)
@@ -1074,13 +1220,20 @@ def main():
         if turn is None:
             board, counts = strip_hover_square(board, counts, res_cur,
                                                assist)
-            # 启动锚定: 视觉行棋(绿框色块)为默认, 奇偶兜底
+            # 启动锚定: 绿框视觉为唯一依据, 不可判则人工兜底
             turn, _asrc = anchor_turn_visual(counts, assist, res_cur)
+            if turn is None:
+                print('!! 无法锚定当前轮次(绿框不可判), 已停止。')
+                return
             print(f'锚定({_asrc}): 轮到{("黑" if turn=="black" else "白")}')
         MY_SIDE = assist
         side = '黑' if assist == 'black' else '白'
         print(f'锚定: 轮到{("黑" if turn=="black" else "白")} | '
               f'盘面黑{counts[0]}白{counts[1]}')
+        _set_st(force=True, assist=assist, turn=turn, turn_src=_asrc,
+                n=n, b=counts[0], w=counts[1], move_no=0, wr=None,
+                lead=None, mv='', status='wait',
+                engine='')
     MY_SIDE = assist            # 无论 auto/手动, 记录我方执色
     LAST_BOARD = board          # SGF 盘面基线
     trend_reset()
@@ -1101,10 +1254,13 @@ def main():
         print(f'!! 指定下 {SIZE_FIX} 路, 但检测到 {n} 路棋盘, 请确认对局后重试')
         return
     if turn is None:
-        # 兜底锚定: 视觉行棋(绿框色块)优先, 奇偶兜底(手动执色路径)
+        # 兜底锚定: 绿框视觉为唯一依据(手动执色路径同理), 不可判则停止
         _rc2 = locals().get('res_cur')
         board, counts = strip_hover_square(board, counts, _rc2, assist)
         turn, _asrc = anchor_turn_visual(counts, assist, _rc2)
+        if turn is None:
+            print('!! 无法锚定当前轮次(绿框不可判), 已停止。')
+            return
         print(f'锚定({_asrc}): 轮到{("黑" if turn=="black" else "白")}')
     print(f'执{side} | 锚定: 轮到{("黑" if turn=="black" else "白")} '
           f'| 盘面黑{counts[0]}白{counts[1]} | Ctrl+C 停止')
@@ -1118,10 +1274,12 @@ def main():
     last_beat = 0.0
     _chip_samp_at = 0.0      # 视觉观察节拍: 色块 2s 采样
     _sig_last = None         # 绿框状态(变化时记录)
+    _sig_stalled_at = 0.0     # 画面停滞提示节流
     _vis_gate_t = 0.0        # 行动门视觉采样节流
     _vis_opp_since = 0.0     # 视觉连续显示"对方回合"的起始时刻(0=无)
     _vis_my_at = 0.0         # 等待期视觉采样节流
     _vis_my_n = 0            # 等待期连续"色块在"次数
+    _vis_flipped = False     # 本对方回合是否已翻回过(只允许一次)
     last_pop = 0.0           # 弹窗应答扫描节流
     last_change = time.time()  # 最近一次盘面变化(显示对方思考时长)
     opening_since = None   # 自动续战新局(空盘)的开始时刻
@@ -1343,7 +1501,11 @@ def main():
                             CAP_HOLD = time.time()
                         print(f'检测到落子 -> 盘面黑{counts[0]}白{counts[1]}, '
                               f'轮到{("黑" if turn=="black" else "白")}')
+                        evt('检测到落子')
+                        _vis_flipped = False
                         move_no += 1
+                        _set_st(turn=turn, b=counts[0], w=counts[1],
+                                move_no=move_no, status='wait', mv='')
                         # 记录本手(推算盘面新增点)供终局落 SGF
                         _key = tuple(board)
                         if _key != GAME_LAST_KEY:
@@ -1363,11 +1525,21 @@ def main():
             now = time.time()
             if now - last_beat > 15:
                 last_beat = now
+                _set_st(turn=turn, b=counts[0], w=counts[1],
+                        move_no=move_no, status='wait')
                 print(f'[心跳] 等待中 | 轮到{("黑" if turn=="black" else "白")} '
                       f'| 盘面黑{counts[0]}白{counts[1]} | '
                       f'我方={("黑" if assist=="black" else "白")}'
                       + (f' | 对方已思考{int(now-last_change)}s'
                          if turn != assist else ''))
+                # 画面停滞提示: 等待超 90s 且绿框信号 60s 未变 =>
+                # 微信窗口大概率后台冻结(不重绘), 提醒用户检查
+                if turn != assist and now - last_change > 90:
+                    if now - _sig_stalled_at > 60:
+                        _sig_stalled_at = now
+                        print('?? 等待>90s 且画面信号未变: 窗口可能已切后台'
+                              '(微信不重绘), 请把游戏窗口点到前台')
+
 
             # ---- 视觉观察节拍(仅记录): 绿框竖线带 RGB 变化 ----
             # 每 2s 采样绿框内 RGB 概要, 概要变化 = 色块出现/消失/变色;
@@ -1390,6 +1562,11 @@ def main():
                     if _sig2:
                         _w2 = winclick.wedge_feature(_rw2, _grd2, _arr2)
                         _ws = (' W(%d,%d@%d-%d)' % _w2) if _w2 else ''
+                        _g2 = winclick.turn_arrow_geo(_rw2, _grd2, _arr2)
+                        if _g2:
+                            _ws += (' 徽章:'
+                                    + ('白方' if _g2 == 'white' else '黑方')
+                                    + '行棋')
                         _log2 = _sig2 + _ws
                         if _log2 != _sig_last:
                             _sig_last = _log2
@@ -1399,14 +1576,19 @@ def main():
                     pass
 
             # 等待期视觉校正 + 参考学习: 官方几何优先; 视觉持续=我方回合
-            # 而盘面稳定未变(对方虚着未被弹窗捕获等), 连续两次则翻回我方
-            if turn != assist and time.time() - last_change > 4.0:
+            # 而盘面稳定未变(对方虚着未被弹窗捕获等), 连续两次则翻回我方。
+            # 我方落子后横幅滞后数秒仍显示"白方行棋"(视觉=我方)会误导本
+            # 校正误翻回合 -> 启动门槛 4s 提到 12s(滞后窗通常 <8s, 之后
+            # 视觉仍=我方才是真"对方虚着"); 且每个对方回合只允许翻一次。
+            if (turn != assist and time.time() - last_change > 12.0
+                    and not _vis_flipped):
                 if time.time() - _vis_my_at > 3.0:
                     _vis_my_at = time.time()
                     try:
                         _srcw, _resw, _infow = visual_turn(res_cur)
                         if _srcw == 'geo':
-                            _wcls = _resw
+                            _wcls = ('mine' if _resw == assist
+                                     else 'opp')  # geo: 白/黑行棋 -> mine/opp
                             _wf = None
                         elif _srcw == 'obox':
                             _wcls = _resw
@@ -1429,6 +1611,7 @@ def main():
                             turn = assist
                             acted_counts = (-1, -1)
                             _vis_my_n = 0
+                            _vis_flipped = True
                     else:
                         _vis_my_n = 0
 
@@ -1673,7 +1856,8 @@ def main():
                     try:
                         _srcv, _resv, _infov = visual_turn(res_cur)
                         if _srcv == 'geo':
-                            _vcls = _resv      # mine/opp 直接是语义
+                            _vcls = ('mine' if _resv == assist
+                                     else 'opp')  # geo: 白/黑行棋 -> mine/opp
                             _vf = None
                         elif _srcv == 'obox':
                             _vcls = _resv
@@ -1884,6 +2068,7 @@ def main():
                               f'{o_s}方视角 {o_wr2*100:.1f}% '
                               f'目差{lead:+.1f} '
                               f'(第{attempt+1}次)')
+                        evt('引擎出招')
                         if wr < 0.05:
                             extreme_count += 1
                             print(f'!! 胜率异常[对方大优], '
@@ -1941,9 +2126,27 @@ def main():
                               f'我方胜率 {wrp:.1f}% '
                               f'目差{lead:+.1f} '
                               f'(第{attempt+1}次)')
+                        evt('引擎出招')
+                    _set_st(force=True, wr=wr, lead=lead, mv=mv,
+                            status='analyze')
+                    # 点击前预检: 引擎读空但视觉上有子样(暗占比高且亮
+                    # 占比低) -> 疑似漏子/网格错位; 点已有子的点会被客户端
+                    # 静默忽略(反馈红圈=彩占比抬高), 形成"失败-重试-黑名单"
+                    # 循环。跳过本手, 强制重对齐后由主循环重新分析。
+                    _pc = click_target_profile(res2, i, col)
+                    if (_pc is not None and board[i][col] == '.'
+                            and _pc[0] >= 0.35 and _pc[2] <= 0.30):
+                        print(f'?? 目标 {mv} 读盘为空, 但邻域暗{_pc[0]:.2f} '
+                              f'彩{_pc[1]:.2f} 亮{_pc[2]:.2f}, '
+                              '疑似漏子/网格错位, 强制重对齐, 本手跳过重分析')
+                        br.align_reset()
+                        time.sleep(0.3)
+                        break
                     click_at(rx, ry)
                     my_char = 'X' if assist == 'black' else 'O'
                     ok_move = False
+                    print(f'  [点击] ({rx:.0f},{ry:.0f}) 窗口{res_cur["rect"]}')
+                    evt('点击落子')
                     for _v, _w in enumerate((0.35, 0.45, 0.8, 1.4)):
                         # 阶梯轮询: 绝大多数点击即时生效, 首个验证点 0.35s
                         time.sleep(_w)
@@ -1967,6 +2170,28 @@ def main():
                         if _chk3 is not None and _chk3[2] != counts:
                             mid_change = True
                             break
+                        # 级联自愈: 点击失败且盘面未变——常见于我方上一手
+                        # 已落但被漏读/回合失步(实际轮到对方, 点空点被服务
+                        # 端忽略)。绿框视觉若明确=对方行棋, 翻回合停止点击。
+                        try:
+                            _vtx = visual_turn(res_cur)
+                            if _vtx[0] == 'geo':
+                                _vcy = ('opp' if _vtx[1] == _other(assist)
+                                        else 'mine')
+                            elif _vtx[0] == 'obox':
+                                _vcy = _vtx[1]
+                            else:
+                                _vcy = None
+                            if _vcy == 'opp':
+                                print(f'[视觉闸] 点击失败+绿框'
+                                      f'({_vtx[2]}) -> 实际轮到对方, '
+                                      f'翻回合停止点击')
+                                turn = _other(assist)
+                                acted_counts = (-1, -1)
+                                cand = None
+                                break
+                        except Exception:
+                            pass
                         if attempt == 0:
                             # 诊断: 点击点邻域像素剖面, 区分
                             # 没点上 / 棋子被最后一手标记遮挡 / 读盘网格错位
@@ -1991,6 +2216,22 @@ def main():
                                       f'均亮{_c.mean():.0f} '
                                       f'(彩>0.1=有彩色标记覆盖; '
                                       f'暗0.4-0.7且彩低=普通棋子)')
+                                # 存档失败帧(圈出目标点), 供事后确认
+                                # 是漏子/网格错位还是彩色标记遮挡
+                                try:
+                                    from PIL import ImageDraw
+                                    _dr = ImageDraw.Draw(_im)
+                                    _rr = max(10, int(res_cur.get(
+                                        'step', 27) * 0.9))
+                                    _dr.ellipse((_gx - _rr, _gy - _rr,
+                                                 _gx + _rr, _gy + _rr),
+                                                outline=(255, 0, 0), width=2)
+                                    _fp = (r'D:\Temp\goai_clickfail_%d.png'
+                                           % int(time.time()))
+                                    _im.save(_fp)
+                                    print(f'  已存点击失败帧 {_fp}')
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
                         print(f'? 第{attempt+1}次未确认我方落子'
@@ -2016,11 +2257,16 @@ def main():
                         # 只有我们落了子 -> 等对手应
                         turn = other(assist)
                         acted_counts = counts
+                        _vis_flipped = False
                     print('✔ 已落子 ' + mv +
                           ('(对手已应)' if not placed else ''))
+                    evt('落子确认')
                     last_wr = wr
                     bad_points.clear()
                     move_no += 1
+                    _set_st(force=True, move_no=move_no, mv=mv,
+                            b=counts[0], w=counts[1], turn=turn,
+                            status='wait')
                     # 记录我方着法供终局落 SGF(同盘面只记一次)
                     _key = tuple(board)
                     if _key != GAME_LAST_KEY:
@@ -2040,6 +2286,8 @@ def main():
                     pass  # 盘面已变, 主循环重新判断
                 else:
                     failed_cycles += 1
+                    _set_st(force=True, status='fail', mv=mv,
+                            b=counts[0], w=counts[1])
                     print(f'!! 本轮落子失败(第{failed_cycles}次)')
                     if failed_cycles == 1:
                         print('   若棋子其实已落(界面标记遮挡致读不到), '
@@ -2063,10 +2311,10 @@ def main():
                         continue
                     acted_counts = (-1, -1)  # 保持我方回合, 稍后重试
             else:
-                # 对方回合: 低算力预分析我方应手(等>3s 再算, 不与快应手抢引擎)
+                # 对方回合: 低算力预分析我方应手(等>2s 再算, 不与快应手抢引擎)
                 try:
                     if (turn != assist and counts == last_counts
-                            and time.time() - last_activity > 3):
+                            and time.time() - last_activity > 2):
                         pre_analyze(n, board, assist,
                                     time.time() - last_activity)
                 except Exception:
