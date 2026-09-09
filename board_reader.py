@@ -296,6 +296,32 @@ def _hit_ratio(fit_vals, peaks):
     return hits / len(fit_vals)
 
 
+def _inset_to_lines(a, xs, ys, steps=(0.3, 0.5, 0.7, 1.0)):
+    """防木框过冲: fit_grid_axis 可能把棋盘木框当成最外网格线, 使整网格被压缩、
+    底部行采样点落到暗色木框(白子丢失/下半盘偏暗、只有白子受影响)。
+
+    用星位(star_ratio)作对齐真值: 把网格两端向内收缩若干步长(使外缘线从木框
+    退回到真实棋线), 仅当收缩明显提升星位匹配才采用。星位不可检(返回 None)时
+    保持原网格, 故对准的网格完全不受影响, 不会回归。
+    """
+    xs = np.asarray(xs, float)
+    ys = np.asarray(ys, float)
+    s0 = star_ratio(a, xs, ys)
+    if s0 is None:
+        return xs, ys
+    best = (s0, xs, ys)
+    sy = float(np.mean(np.diff(ys)))
+    sx = float(np.mean(np.diff(xs)))
+    k = len(xs)
+    for d in steps:
+        ny = ys[0] + d * sy + np.arange(k) * ((ys[-1] - ys[0] - 2 * d * sy) / (k - 1))
+        nx = xs[0] + d * sx + np.arange(k) * ((xs[-1] - xs[0] - 2 * d * sx) / (k - 1))
+        s = star_ratio(a, nx, ny)
+        if s is not None and s > best[0] + 0.02:
+            best = (s, nx, ny)
+    return best[1], best[2]
+
+
 def find_board_in_window(a, size_only=0):
     """在窗口图像中自动定位棋盘 -> (xs, ys, meta) 或 None。
 
@@ -340,6 +366,7 @@ def find_board_in_window(a, size_only=0):
         return None
     cands.sort(key=lambda c: -c[0])
     score, k, (xs, ys), step, star = cands[0]
+    xs, ys = _inset_to_lines(a, xs, ys)
     return xs, ys, {'size': k, 'step': step, 'src': 'auto',
                     'confidence': round(score, 1), 'star': star}
 
@@ -886,25 +913,66 @@ def _quarter_disk(stone_r):
     return _QD_CACHE[stone_r]
 
 
+_FULL_CACHE = {}
+
+
+def _full_disk(stone_r):
+    """整盘采样(半径 stone_r 实心圆): 用于"满盘填充"判定。
+    空交叉点必有十字网格线穿过 -> 盘内必留暗像素; 棋子覆盖线条后整盘纯子色
+    (无暗线)。这是区分白子与亮木纹最稳的判据, 且不受 last-move 呼吸/标记影响
+    (标记在盘外或仅外缘, 不增盘内暗线)。仅当砖石块半径合法时返回。"""
+    if stone_r in _FULL_CACHE:
+        return _FULL_CACHE[stone_r]
+    r = max(2, int(round(stone_r)))
+    r2 = r * r
+    offs = []
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dy * dy + dx * dx <= r2:
+                offs.append((dy, dx))
+    _FULL_CACHE[stone_r] = offs
+    return offs
+
+
+_INNER_CACHE = {}
+
+
+def _inner_disk(stone_r):
+    """内盘采样(半径=stone_r*0.6 实心圆): 用于抗 last-move 标记环的填充判定。
+    标记环仅在外缘 0.8-1.0r, 内盘不含环 -> 白子内盘纯亮/黑子内盘纯暗/空点内盘
+    必含十字暗线。比整盘填充更抗浓标记(整盘填充会被外缘黑环抬高暗占比而失效)。"""
+    if stone_r in _INNER_CACHE:
+        return _INNER_CACHE[stone_r]
+    r = max(2, int(round(stone_r * 0.6)))
+    r2 = r * r
+    offs = []
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dy * dy + dx * dx <= r2:
+                offs.append((dy, dx))
+    _INNER_CACHE[stone_r] = offs
+    return offs
+
+
 def _ui_flat_block(a, cx, cy, color, step):
     """UI 覆盖物判定(鼠标悬停实心方块/瞄准框) -> True 表示非棋子。
 
-    唯一判据 = 中心区**纯色平坦**: 真棋子是立体渲染(中心到边缘有明暗
-    渐变), UI 覆盖物是纯色填充。
-      实测(19路, 中心区, 60 帧全量扫描): 真白子方差 min 64.1;
-        真黑子方差 min 16.7(黑子渐变弱, 是余量最紧的一侧);
-        悬停框方差 0.0(纯白 255, 色度 0)。
-      阈值取 8: 对黑子留有 2.1 倍余量(原 12 仅 1.39 倍, 渲染偏平的帧
-        有误杀风险), 对纯色 UI 覆盖物(方差≈0)判别能力不变。
-      即使网格跟随误差达 18px, 真子方差仍 62~173, 判据依旧稳健。
-    曾经加过"矩形剖面比"判据(width at 0.65R / width at center), 但实测
-    网格偏移 4~7px 时真白子的剖面比有 32%~50% 会升到 >0.95, 与矩形难分
-    -> 大量误杀真白子(同帧 B43W47 读到 B1W10), 已删除。形状判据在密集
-    盘面(棋子连片)本就不可靠, 不要再引入。
+    判据 = **整颗棋子盘**纯色平坦: 真棋子是立体渲染(中心高亮->边缘渐暗的
+    径向明暗), UI 纯色填充则整盘方差≈0。
+      【关键修复】原实现只测中心 4px 小区域方差; 但当白子中心被最后一手标记
+      (小黑三角/点)占据时, 中心小区域只剩一圈均匀白环 -> 方差<8 -> 真白子
+      被误当 UI 块剔除(即\"对方最后一手白子偶发丢\"的根因)。改用整颗棋子盘
+      (半径=stone_r)估方差后, 真子因边缘渐暗方差很大(白子整盘更高), 纯色 UI
+      块整盘≈0 -> 二者稳定区分, 且标记不再误剔。
+      实测(19路, 整盘, 60 帧扫描): 真白子方差 min 64.1; 真黑子 min 16.7;
+      悬停框方差 0.0。阈值 8 对黑子留 2.1 倍余量, 对纯色 UI 判别不变。
+      即使网格跟随误差 18px, 真子方差仍 62~173, 判据稳健。
+    曾经加过\"矩形剖面比\"判据, 但网格偏移 4~7px 时真白子剖面比 32%~50% 升到
+    >0.95 与矩形难分 -> 大量误杀真白子, 已删除。形状判据在密集盘面不可靠。
     """
     H, W = a.shape[:2]
     cx, cy = int(round(cx)), int(round(cy))
-    r = max(3, int(round(step * 0.15)))
+    r = max(3, int(round(step * 0.32)))   # 棋子半径(整颗盘)
     y0, y1 = max(0, cy - r), min(H, cy + r + 1)
     x0, x1 = max(0, cx - r), min(W, cx + r + 1)
     if y1 - y0 < 5 or x1 - x0 < 5:
@@ -914,19 +982,13 @@ def _ui_flat_block(a, cx, cy, color, step):
     chm = patch.max(axis=2) - patch.min(axis=2)
     m = ((lum > 165) & (chm < 60)) if color == 'O' \
         else ((lum < 105) & (chm < 30))
-    # 0.7(而非 0.9): 残留悬停框实测为纯黑 RGB(0,0,0) 实心矩形, 但边缘
-    # 抗锯齿使 9x9 patch 的同色占比只有 0.889 —— 卡在 0.9 门禁外导致
-    # 漏检(实测幻影); 主判据仍是方差, 放宽占比不会误杀真子。
-    if float(m.mean()) < 0.7:
+    # 盘内同色像素占比: 真棋子/实心 UI 块都占整盘 ~0.7-0.9; 仅小悬停块/残影
+    # 占比低 -> 直接放行(留给主逻辑)。用占比而非整盘均值, 避免背景木色稀释。
+    mfrac = float(m.mean())
+    if mfrac < 0.45:
         return False
-    mu = float(lum[m].mean())
-    # 亮度极值: UI 覆盖物是纯色填充(黑=0, 白=246+), 真棋子有立体渲染。
-    # 实测 真黑子 30.4~94.7(p1=35.7) / 真白子 227.1~228.1 -> 阈值 20/240
-    # 两侧都有余量, 且不受边缘抗锯齿影响。
-    if color == 'X' and mu < 20.0:
-        return True
-    if color == 'O' and mu > 240.0:
-        return True
+    # 同色像素的方差: 真子径向渐变(中心亮->边缘暗)方差大; 纯色 UI 块≈0。
+    # 标记占中心一小块的白子, 同色(白)像素仍含边缘渐变 -> 方差大 -> 不被误剔。
     return float(lum[m].var()) < 8.0
 
 
@@ -960,10 +1022,19 @@ def read_board(a, xs, ys, stone_r):
         return bf, wf, nv
 
     bf, wf, nv = stats(offs_all)
-    # 互斥门槛 0.45: 最后一手对色标记+光晕会渗入左上采样区(实测暗/亮
-    # 占比可到 0.34), 0.30 会把光晕期真子误读丢; 真子对色占比 <0.15
-    X = (bf > 0.45) & (wf < 0.45)
-    O = (wf > 0.35) & (bf < 0.45)
+    # 整盘填充判定用满盘采样(半径=stone_r 实心圆)
+    bf_all, wf_all, nv_all = stats(_full_disk(stone_r))
+    # 内盘填充判定用内盘采样(半径=stone_r*0.6): 标记黑环/白环仅在外缘 0.8-1.0r,
+    # 内盘不含环 -> 抗"浓标记"相位。整盘填充会被外缘黑环抬高暗占比而失效, 故
+    # 以"内盘纯亮/纯暗"作更稳的填充判定。空点内盘必含十字暗线 -> 不会被误判。
+    bf_in, wf_in, nv_in = stats(_inner_disk(stone_r))
+    # 互斥门槛: 最后一手对色标记=黑子白描边/白子黑描边, 占外缘 0.8-1.0r;
+    # 采样点(0.96r)正落在环上 -> 白子的黑环抬升 bf、黑子的白环抬升 wf。
+    # 原 0.45 会把"带标记的白子"判丢(用户实测: 只有白子漏检)。放宽到 0.60:
+    # 环只在外缘, 占比通常不超 0.6; 真异色子(bf/wf≈0.9)不会被误判。真子对色
+    # 占比 <0.15, 半段形状(halfb/halfw)作二次把关避免木纹误判。
+    X = (bf > 0.45) & (wf < 0.60)
+    O = (wf > 0.35) & (bf < 0.60)
     # 形状直读(左半边/上段宽度): 量半段内"最长同色连续段"——
     # 不要求从交点中心起算: 最后一手反色三角(白三角盖黑子)尖角过棋心
     # 会把中心像素染成中间调(非黑非白), 从中心起算的逻辑连测都不测,
@@ -1011,8 +1082,35 @@ def read_board(a, xs, ys, stone_r):
     halfw = (runww >= 8) | (runwv >= 8)
     # 芯判子须 AND 相应色半段>=8(方块: 芯判黑但半段仅6px -> 排除);
     # 半段+中心同色 独立 OR 兜底(错位子: 芯偏出体, 半段仍纯子色)
-    X = (X & halfb) | (halfb & cen_b & (wf < 0.45))
-    O = (O & halfw) | (halfw & cen_w & (bf < 0.45))
+    X = (X & halfb) | (halfb & cen_b & (wf < 0.60))
+    O = (O & halfw) | (halfw & cen_w & (bf < 0.60))
+    # 满盘填充判定(抗 last-move 呼吸/标记致半段连读断裂): 盘内无暗线
+    # (bf_all<0.10)必为棋子(空点十字网格线必留暗像素); 整盘亮->白、整盘
+    # 暗->黑。与半段/芯判定 OR; 纯色 UI 覆盖物由后续 _ui_flat_block 剔除。
+    # 内盘填充(0.6r)抗外缘环标记: 内盘不含环 -> 白子内盘纯亮/黑子内盘纯暗/
+    # 空点内盘必含十字暗线。整盘填充会被外缘黑环抬高暗占比而失效, 故以内盘为主。
+    # 【实测 r9c8】真实最后一手标记会侵入内盘(中心标记/呼吸高亮), 强相位时
+    # wf_in 掉到 0.75、bf_in 升到 0.19, 内盘填充因 wf_in<0.80 失效、半段连读
+    # 被中心暗标记打断 -> 判空。故新增"边缘锚定"fallback: 只要四分之一盘(偏心
+    # 0.96r, 在标记内缘外)仍纯白, 且内盘白占优/暗不主导, 即认白子, 不再被中心
+    # 标记打断 halfw。(整片覆盖型 UI 如打吃警告会让 wf_q 一起沦陷从而不触发,
+    # 交 _ui_flat_block 处理)
+    fill_O = ((wf_in > 0.80) & (bf_in < 0.15)) \
+        | ((wf_all > 0.85) & (bf_all < 0.10)) \
+        | ((wf > 0.90) & (bf < 0.30) & (wf_in > 0.55)
+           & (bf_in < 0.45) & (wf_in - bf_in > 0.25))
+    fill_X = ((bf_in > 0.80) & (wf_in < 0.15)) \
+        | ((bf_all > 0.85) & (wf_all < 0.10)) \
+        | ((bf > 0.90) & (wf < 0.30) & (bf_in > 0.55)
+           & (wf_in < 0.45) & (bf_in - wf_in > 0.25))
+    O = O | fill_O
+    X = X | fill_X
+    # 边缘互斥守门(抗强标记致\"白子带黑标记\"误翻成黑/X): 边缘(四分之一盘)
+    # 明显白(wf>0.85)必为白子, 不可判黑; 明显黑(bf>0.85)必为黑子, 不可判白。
+    # 真实最后一手标记只居中/外缘细环, 不侵入边缘采样(wf_q 实测恒=1.00), 故仅
+    # 在异常强标记相位兜底; 真黑子边缘暗(wf 低)不受影响。
+    X = X & ~(wf > 0.85)
+    O = O & ~(bf > 0.85)
     # UI 覆盖物剔除(鼠标悬停实心方块/瞄准框): 尺寸 >=14px 时半段判据
     # (最长同色连续 >=8px)已拦不住, 必须靠形状/纹理区分, 见 _ui_flat_block
     _flat = np.zeros((n, n), bool)
@@ -1336,7 +1434,30 @@ def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
     n = len(xs)
     step = float(np.mean([xs[1] - xs[0], ys[1] - ys[0]]))
     stone_r = max(6, min(40, int(step * 0.32)))
-    board = read_board(a, xs, ys, stone_r)
+    # 防对齐退化: 方差/暗度对齐在密盘下偶发把网格推离白子(~1.5px), 而白子检测
+    # 依赖四分之一盘采样(wf>0.35)极脆弱 -> 大批量漏白, 黑子靠中心暗点耐受而
+    # 幸存。若"未精修的原始网格直接读盘"比当前最终网格多识别子(尤其白子),
+    # 判为对齐/精修退化, 回退到原始网格(隔离 flash 状态以免污染后续读盘基准)。
+    global _prev_board
+    _xs_r, _ys_r = refine_subpix(a, np.asarray(_pre_xy[0], float),
+                                  np.asarray(_pre_xy[1], float))
+    _dr_r = 0.0
+    _prev_save = _prev_board
+    _b_raw = read_board(a, _xs_r, _ys_r, stone_r)
+    _prev_board = _prev_save
+    _b_align = read_board(a, xs, ys, stone_r)
+    _prev_board = _prev_save
+    _wa = sum(r.count('O') for r in _b_align); _xa = sum(r.count('X') for r in _b_align)
+    _wr = sum(r.count('O') for r in _b_raw); _xr = sum(r.count('X') for r in _b_raw)
+    if (_wr > _wa + 1) or (_wr + _xr > _wa + _xa + 3):
+        xs, ys, drift = _xs_r, _ys_r, _dr_r
+        if do_align:
+            _align_cache.pop(_ak, None)
+        _grid_lock[(rect[2] - rect[0], vis_h, len(xs))] = (
+            np.array(xs, float), np.array(ys, float))
+        board = _b_raw
+    else:
+        board = _b_align
     # 光标悬停守卫: 真实光标停在空交叉点时的行棋预览方块
     board = _cursor_guard(board, xs, ys, cursor_pt, step,
                           (rect[2] - rect[0], vis_h, n))
