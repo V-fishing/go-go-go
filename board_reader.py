@@ -241,6 +241,26 @@ def cell_bg_is_wood(a, xs, ys):
     return r > 180 and r > g > b and b < 200
 
 
+def _dedup_peaks(peaks, runlen, gap=14):
+    """合并间距过近的候选峰(保留 run-length 最强者)。
+
+    木框/UI 的密集细线簇(间距~3px, 如棋盘木框上边框)会被塌缩成一条, 使其
+    与真实棋盘线(间距~27px)错开约半格; fit_grid_axis 拟合时该簇产生的网格
+    各线都偏离真实棋盘线 -> 命中数骤降, 真实棋盘线胜出, 避免网格整行上移。
+    """
+    peaks = np.asarray(peaks, int)
+    if len(peaks) == 0:
+        return np.array([], float)
+    keep = []
+    for p in sorted(peaks.tolist()):
+        if keep and p - keep[-1] < gap:
+            if runlen[p] > runlen[keep[-1]]:
+                keep[-1] = p
+        else:
+            keep.append(p)
+    return np.array(keep, float)
+
+
 def _line_candidates(a):
     """行长检测候选线(局部峰值): (rows, cols, dark)"""
     lum = a.mean(axis=2)
@@ -263,6 +283,8 @@ def _line_candidates(a):
     cols = np.array(line_peaks(cr, thr_c), float)
     rows = rows[(rows > 18) & (rows < hgt - 18)]
     cols = cols[(cols > 18) & (cols < wid - 18)]
+    rows = _dedup_peaks(rows.astype(int), rr)
+    cols = _dedup_peaks(cols.astype(int), cr)
     return rows, cols, dark
 
 
@@ -534,15 +556,23 @@ def _line_color_mask(a):
             & (r < 250)).astype(np.int8)
 
 
-def align_by_variance(a, xs, ys, span=10):
+def align_by_variance(a, xs, ys, span=10, max_shift=3.0):
     """网格微对齐: 找使交叉点采样亮度方差最大的 (dx,dy)。
 
     网格正对棋子时每个交叉点采样最纯粹(黑/白/木, 方差大);
     偏移时混入相邻子/线, 采样值趋中, 方差小。
+
+    max_shift: 只接受 |dx|,|dy| <= max_shift 的**微调**。
+    网格定位(refine 后残差 <1px)本身已足够准, 全域(±span)搜索会在
+    密集盘面锁定错误局部峰(实测把网格推偏 ~5.6px ≈ 1/4 格, 导致黑子
+    成片漏检: 实测同帧 B43W47 -> B21W36), 故严格限制为小幅校正。
+    需要大范围纠偏时由 locate_board / refine_grid 负责(它们有物理意义
+    更强的线命中与星位校验)。
     """
     n = len(xs)
     step = float(np.mean([xs[1] - xs[0], ys[1] - ys[0]]))
     r = max(4, min(30, int(step * 0.28)))
+    lim = int(min(span, max_shift))
     lum = a.mean(axis=2).astype(np.float64)
     h, w = lum.shape
     Xg = np.round(np.asarray(xs))[None, :] + np.zeros((n, n))
@@ -553,8 +583,8 @@ def align_by_variance(a, xs, ys, span=10):
     ody = offs[:, 0]
     odx = offs[:, 1]
     best = None
-    for dy in range(-span, span + 1):
-        for dx in range(-span, span + 1):
+    for dy in range(-lim, lim + 1):
+        for dx in range(-lim, lim + 1):
             yy = (Yg + dy)[..., None] + ody[None, None, :]
             xx = (Xg + dx)[..., None] + odx[None, None, :]
             ok = ((yy >= 0) & (yy < h) & (xx >= 0) & (xx < w))
@@ -572,6 +602,37 @@ def align_by_variance(a, xs, ys, span=10):
     if best[0] < 1200:
         return xs, ys  # 盘面太疏(如空盘), 方差无区分度, 不做对齐
     return xs + dx, ys + dy
+
+
+def align_checked(a, xs, ys, span=10, max_shift=3.0):
+    """对齐 + 合理性校验: 不通过则回退对齐前网格。
+
+    校验(任一不满足即回退):
+      1. 可见性: 棋盘区域仍为木色基调(board_visible);
+      2. 线贴合度: 预测线位置的暗像素占比不得明显下降
+         (_line_coverage, 网格贴合真实棋盘线时应更高或持平)。
+    方差是纯统计量, 密集盘面下会把网格推到"采样更极端"的错位处,
+    物理校验能拦下这类假对齐; 宁可用未对齐的原网格也不读错盘。
+    """
+    try:
+        nx, ny = align_by_variance(a, xs, ys, span=span,
+                                   max_shift=max_shift)
+    except Exception:
+        return xs, ys
+    if float(np.mean(np.abs(np.asarray(nx, float) - np.asarray(xs, float)))
+             + np.mean(np.abs(np.asarray(ny, float)
+                              - np.asarray(ys, float)))) < 1e-6:
+        return xs, ys           # 未发生位移, 无需校验
+    try:
+        if not board_visible(a, nx, ny):
+            return xs, ys
+        c0 = _line_coverage(a, xs, ys)
+        c1 = _line_coverage(a, nx, ny)
+        if c1 < c0 * 0.85:      # 线贴合度明显变差 -> 假对齐
+            return xs, ys
+    except Exception:
+        return xs, ys
+    return nx, ny
 
 
 def coarse_align(a, xs, ys, span=12):
@@ -606,6 +667,54 @@ def coarse_align(a, xs, ys, span=12):
                 best = (sc, dx, dy)
     _, dx, dy = best
     return xs + dx, ys + dy
+
+
+
+def refine_subpix(a, xs, ys):
+    """亚像素网格精修: 每条线在 ±2px 带内按"相对带内中位数的暗度"加权质心,
+    再对整轴做等距模型最小二乘(残差<0.8px 才采用模型)。
+    坐标从 ±0.5px 整数量化提升到 ~0.1px 且帧间稳定(悬停方块四角验证、
+    采样芯、点击坐标等下游全部受益; 它们是"坐标系精度"这种共通地基)。"""
+    try:
+        n = len(xs)
+        if n < 9:
+            return xs, ys
+        lum = a.mean(axis=2).astype(np.float64)
+        hgh, wid = lum.shape
+        out_x = np.asarray(xs, float).copy()
+        out_y = np.asarray(ys, float).copy()
+        for axis in (0, 1):
+            coords = out_x if axis == 0 else out_y
+            for i, c in enumerate(coords):
+                c0 = int(round(c))
+                if c0 < 2:
+                    continue
+                if axis == 0:
+                    if c0 > wid - 3:
+                        continue
+                    band = lum[:, c0 - 2:c0 + 3]
+                else:
+                    if c0 > hgh - 3:
+                        continue
+                    band = lum[c0 - 2:c0 + 3, :]
+                bg = float(np.median(band))
+                w = np.maximum(0.0, bg - band)
+                wsum = w.sum(axis=0)
+                den = float(wsum.sum())
+                if den < 6.0:
+                    continue
+                pos = np.arange(c0 - 2, c0 + 3)
+                coords[i] = float((wsum * pos).sum() / den)
+            # 等距模型 + 残差门控(棋子压线会把个别质心带偏, 模型吸收)
+            idx = np.arange(n)
+            A = np.vstack([idx, np.ones(n)]).T
+            coef, *_ = np.linalg.lstsq(A, coords, rcond=None)
+            model = coef[0] * idx + coef[1]
+            if np.abs(coords - model).max() < 0.8:
+                coords[:] = model
+        return out_x, out_y
+    except Exception:
+        return xs, ys
 
 
 def refine_grid_safe(a, xs, ys, tol=4):
@@ -696,6 +805,7 @@ def classify_px(px):
 
 _prev_board = None
 _flog = [0.0]   # 闪动诊断打印节流
+_rowdiag_t = [0.0]   # 按行诊断打印节流(BR_ROWDIAG)
 _top_bad = 0    # 首行异常连续帧计数: 单帧(动画瞬态)只丢不缓存, 连续2帧才清缓存
 
 
@@ -776,10 +886,54 @@ def _quarter_disk(stone_r):
     return _QD_CACHE[stone_r]
 
 
+def _ui_flat_block(a, cx, cy, color, step):
+    """UI 覆盖物判定(鼠标悬停实心方块/瞄准框) -> True 表示非棋子。
+
+    唯一判据 = 中心区**纯色平坦**: 真棋子是立体渲染(中心到边缘有明暗
+    渐变), UI 覆盖物是纯色填充。
+      实测(19路, 中心区, 60 帧全量扫描): 真白子方差 min 64.1;
+        真黑子方差 min 16.7(黑子渐变弱, 是余量最紧的一侧);
+        悬停框方差 0.0(纯白 255, 色度 0)。
+      阈值取 8: 对黑子留有 2.1 倍余量(原 12 仅 1.39 倍, 渲染偏平的帧
+        有误杀风险), 对纯色 UI 覆盖物(方差≈0)判别能力不变。
+      即使网格跟随误差达 18px, 真子方差仍 62~173, 判据依旧稳健。
+    曾经加过"矩形剖面比"判据(width at 0.65R / width at center), 但实测
+    网格偏移 4~7px 时真白子的剖面比有 32%~50% 会升到 >0.95, 与矩形难分
+    -> 大量误杀真白子(同帧 B43W47 读到 B1W10), 已删除。形状判据在密集
+    盘面(棋子连片)本就不可靠, 不要再引入。
+    """
+    H, W = a.shape[:2]
+    cx, cy = int(round(cx)), int(round(cy))
+    r = max(3, int(round(step * 0.15)))
+    y0, y1 = max(0, cy - r), min(H, cy + r + 1)
+    x0, x1 = max(0, cx - r), min(W, cx + r + 1)
+    if y1 - y0 < 5 or x1 - x0 < 5:
+        return False
+    patch = a[y0:y1, x0:x1]
+    lum = patch.mean(axis=2)
+    chm = patch.max(axis=2) - patch.min(axis=2)
+    m = ((lum > 165) & (chm < 60)) if color == 'O' \
+        else ((lum < 105) & (chm < 30))
+    # 0.7(而非 0.9): 残留悬停框实测为纯黑 RGB(0,0,0) 实心矩形, 但边缘
+    # 抗锯齿使 9x9 patch 的同色占比只有 0.889 —— 卡在 0.9 门禁外导致
+    # 漏检(实测幻影); 主判据仍是方差, 放宽占比不会误杀真子。
+    if float(m.mean()) < 0.7:
+        return False
+    mu = float(lum[m].mean())
+    # 亮度极值: UI 覆盖物是纯色填充(黑=0, 白=246+), 真棋子有立体渲染。
+    # 实测 真黑子 30.4~94.7(p1=35.7) / 真白子 227.1~228.1 -> 阈值 20/240
+    # 两侧都有余量, 且不受边缘抗锯齿影响。
+    if color == 'X' and mu < 20.0:
+        return True
+    if color == 'O' and mu > 240.0:
+        return True
+    return float(lum[m].var()) < 8.0
+
+
 def read_board(a, xs, ys, stone_r):
     """向量化读盘: 整盘一次 numpy 批量取点/统计, 开销 ~ms 级。
     真子判定附加环带测试: 采样外环须同为子色(圆棋子到边缘 8-9px),
-    悬停预览方块(10-12px, 半径~5px)外环为木色 -> 不被认作棋子。
+    UI 覆盖物(悬停框等)由半段宽度 + _ui_flat_block 形状/纹理双重排除。
     """
     n = len(xs)
     H, W = a.shape[:2]
@@ -859,10 +1013,38 @@ def read_board(a, xs, ys, stone_r):
     # 半段+中心同色 独立 OR 兜底(错位子: 芯偏出体, 半段仍纯子色)
     X = (X & halfb) | (halfb & cen_b & (wf < 0.45))
     O = (O & halfw) | (halfw & cen_w & (bf < 0.45))
+    # UI 覆盖物剔除(鼠标悬停实心方块/瞄准框): 尺寸 >=14px 时半段判据
+    # (最长同色连续 >=8px)已拦不住, 必须靠形状/纹理区分, 见 _ui_flat_block
+    _flat = np.zeros((n, n), bool)
+    for _i in range(n):
+        for _j in range(n):
+            if not (X[_i, _j] or O[_i, _j]):
+                continue
+            _flat[_i, _j] = _ui_flat_block(
+                a, ix[_j], iy[_i], 'X' if X[_i, _j] else 'O', step)
+    if _flat.any():
+        X = X & ~_flat
+        O = O & ~_flat
     # 内芯(离轴)19路仅 4 采样点, nv 下限 3 即足够占比统计
     grid = np.where(nv < 3, '?', np.where(X, 'X', np.where(O, 'O', '.')))
     board = [''.join(r) for r in grid.tolist()]
     _flash_check(a, xs, ys, stone_r, board)
+    # 按行诊断(BR_ROWDIAG): 每行中心点中位亮度 + 白/黑子计数。
+    # 下半行 L 明显低于上半 -> 亮度梯度(阴影/反光); L 正常却仍少 O ->
+    # 网格 y 向漂移/透视斜切导致采样点偏出子体。两路均优先丢白(白检测
+    # 需整片亮像素, 比黑脆弱)。用于定位"下半部分白子大量丢失"。
+    if os.environ.get('BR_ROWDIAG'):
+        import time as _t
+        if _t.time() - _rowdiag_t[0] > 2:
+            _rowdiag_t[0] = _t.time()
+            _parts = []
+            for _i in range(n):
+                _rl = lum2[iy[_i], ix]
+                _med = int(np.median(_rl))
+                _no = sum(1 for _j in range(n) if board[_i][_j] == 'O')
+                _nx = sum(1 for _j in range(n) if board[_i][_j] == 'X')
+                _parts.append(f'r{_i}:L{_med:3d}O{_no}X{_nx}')
+            print('[ROWDIAG]', ' '.join(_parts))
     return board
 
 
@@ -932,6 +1114,69 @@ def align_reset():
     _grid_lock.clear()
 
 
+# ---------------- 光标悬停守卫 ----------------
+# 行棋预览方块(悬停实心框)跟随真实光标, 只出现在**空交叉点**上,
+# 颜色=行棋方, 且黑框带渐变/坐标文字(方差 25~209), 平坦判据拦不住。
+# 根治: 光标所在交点若"上帧空、本帧有子"则本帧置空 —— 真子不会因
+# 悬停而出现; 真落子下一帧自然保留(仅延迟 1 个读盘周期)。
+# PostMessage 注入的合成悬停只发生在点击目标, 点击后该点立即变为真子,
+# 不产生持续幻影, 无需处理。
+_cursor_last_raw = {}   # key -> 上一帧原始 board(未经守卫修改)
+_cursor_hover = {}      # key -> ((i,j), base)
+
+
+def _cursor_pos():
+    """真实光标屏幕坐标(失败 None)"""
+    pt = ctypes.wintypes.POINT()
+    if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+        return (pt.x, pt.y)
+    return None
+
+
+def _cursor_guard(board, xs, ys, cursor_pt, step, key):
+    """光标悬停守卫: 冻结"光标所在交点"为进入该点前的读数。
+
+    行棋预览方块跟随真实光标、只出现在空交叉点、颜色=行棋方; 黑框带
+    渐变与坐标文字(实测方差 25~209), 平坦度判据拦不住, 故改为按位置
+    排除:
+      进入 P 前 P 为空 -> 冻结 '.'(框被忽略, 光标停留期间持续有效);
+      进入 P 前 P 有子 -> 冻结该子(有子的点不画预览框, 本无干扰)。
+    base 只在"光标切换到新交点"的那一帧采样, 且取**上一帧原始读数**
+    (那一刻光标还在别处、该点无框)。若存被守卫修改过的值, 框的值会
+    成为下一帧的 base, 守卫失效(实测只挡住一帧); 若存本帧原始值,
+    同样会把框当基准。
+    代价: 光标停留期间该点不再更新; 对手若恰好落子于此, 需待光标移开
+    后下一帧才识别(概率 1/361, 移开即恢复)。
+    """
+    idx = None
+    if cursor_pt is not None:
+        j = int(np.argmin(np.abs(np.asarray(xs, float) - cursor_pt[0])))
+        i = int(np.argmin(np.abs(np.asarray(ys, float) - cursor_pt[1])))
+        if (abs(xs[j] - cursor_pt[0]) <= step * 0.55
+                and abs(ys[i] - cursor_pt[1]) <= step * 0.55):
+            idx = (i, j)
+    prev_raw = _cursor_last_raw.get(key)
+    st = _cursor_hover.get(key)
+    out = board
+    if idx is not None:
+        i, j = idx
+        if st is None or st[0] != idx:
+            base = '.'
+            if prev_raw and i < len(prev_raw) and j < len(prev_raw[i]):
+                c = prev_raw[i][j]
+                base = c if c in 'XO.' else '.'
+        else:
+            base = st[1]
+        if board[i][j] != base:
+            out = list(board)
+            out[i] = board[i][:j] + base + board[i][j + 1:]
+        _cursor_hover[key] = (idx, base)
+    else:
+        _cursor_hover.pop(key, None)
+    _cursor_last_raw[key] = board
+    return out
+
+
 def read_current(use_calib=False, force_auto=False, do_align=True,
                  force_size=0):
     """读当前窗口棋局: 截屏后交给 read_img 处理。
@@ -946,16 +1191,21 @@ def read_current(use_calib=False, force_auto=False, do_align=True,
     img = ImageGrab.grab(bbox=(rect[0], rect[1],
                                rect[2], rect[1] + vis_h)).convert('RGB')
     a = np.asarray(img).astype(np.int16)
+    cp = _cursor_pos()
+    cursor_pt = None
+    if cp is not None and (rect[0] <= cp[0] < rect[2]
+                           and rect[1] <= cp[1] < rect[1] + vis_h):
+        cursor_pt = (cp[0] - rect[0], cp[1] - rect[1])
     res = read_img(a, rect, vis_h, use_calib=use_calib,
                    force_auto=force_auto, do_align=do_align,
-                   force_size=force_size)
+                   force_size=force_size, cursor_pt=cursor_pt)
     if res is not None:
         res['img'] = img
     return res
 
 
 def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
-             do_align=True, force_size=0):
+             do_align=True, force_size=0, cursor_pt=None):
     """对给定窗口帧(a: 窗口相对坐标的 RGB 数组)做完整读盘
     (线路检测/尺寸选择/逐点分类)。与窗口截屏解耦, 供离线回放。
     返回 dict(含 n/board/xs/ys/rect/src/step/stone_r/drift)或 None。
@@ -1019,7 +1269,8 @@ def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
                 _size_hint = 0
     _pre_xy = (np.asarray(xs, float), np.asarray(ys, float))  # 对齐前网格
     if do_align:
-        # 自适应微对齐: align_by_variance 开销大(~280ms)。当前检测网格与
+        # 自适应微对齐: align_checked 开销较大(限制偏移后已大幅下降)。
+        # 当前检测网格与
         # 上次对齐结果一致(均差<=2px)且未到强制周期时直接复用已对齐网格,
         # 跳过高价对齐(窗口静止时对齐结果本就比逐帧检测更准);
         # 位移超限(窗口拖动/换局/画面切换)立即重对齐;
@@ -1038,7 +1289,7 @@ def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
         if _reuse and _align_cnt % 250 != 0:
             xs, ys = _ent[0], _ent[1]   # 复用上次对齐结果
         else:
-            _xs2, _ys2 = align_by_variance(a, xs, ys)
+            _xs2, _ys2 = align_checked(a, xs, ys)
             if _ent is not None and len(_ent[0]) == len(_xs2):
                 _dx2 = float(np.mean(np.abs(np.asarray(_xs2, float)
                                             - _ent[0])))
@@ -1056,6 +1307,7 @@ def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
                                      np.array(ys, float))
 
     xs, ys, drift = refine_grid(a, xs, ys)
+    xs, ys = refine_subpix(a, xs, ys)
     # ---- 网格冻结: 静止窗口下坐标完全锁定(防逐帧 refine 微抖把采样芯
     # 跨过棋子边缘/光晕带); 检测到真实移动(均差>1.5px)才更新锁定 ----
     _lk = _grid_lock.get((rect[2] - rect[0], vis_h, len(xs)))
@@ -1085,6 +1337,9 @@ def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
     step = float(np.mean([xs[1] - xs[0], ys[1] - ys[0]]))
     stone_r = max(6, min(40, int(step * 0.32)))
     board = read_board(a, xs, ys, stone_r)
+    # 光标悬停守卫: 真实光标停在空交叉点时的行棋预览方块
+    board = _cursor_guard(board, xs, ys, cursor_pt, step,
+                          (rect[2] - rect[0], vis_h, n))
     # 首行异常防护: 棋盘首行(靠边)几乎不会同时落 6+ 子; 一行子里
     # >=6 且大部分是同一色 = 网格首行被锚到棋盘上沿以外的 UI 点阵
     # (头像圆点/段位/计时等白色元素) -> 整帧丢弃并清网格缓存,

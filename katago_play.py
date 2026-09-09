@@ -151,6 +151,35 @@ def park_cursor():
 
 
 
+def _hover_square(res, i, j):
+    """光标格是否悬停实心方块(>=14px): 方块四角(±0.22*step)仍为子色,
+    而圆棋子四角为木色。用于屏蔽被误读成棋子的悬停方块(旧布局 12px,
+    当前布局 >=14px 时左半段 run>=8 会误判成子)。"""
+    try:
+        import numpy as _np
+        im = res.get('img')
+        if im is None:
+            return False
+        xs, ys = res['xs'], res['ys']
+        if i >= len(ys) or j >= len(xs):
+            return False
+        a = _np.asarray(im).astype(_np.int16)
+        lum = a.mean(axis=2)
+        chm = a.max(axis=2) - a.min(axis=2)
+        step = float(res.get('step', 27))
+        o = max(5, int(round(step * 0.25)))
+        xx, yy = int(round(xs[j])), int(round(ys[i]))
+        ok = 0
+        for (dy0, dx0) in ((-o, -o), (-o, o), (o, -o), (o, o)):
+            L = lum[yy + dy0, xx + dx0]
+            C = chm[yy + dy0, xx + dx0]
+            if (L < 105 and C < 30) or (L > 165 and C < 60):
+                ok += 1
+        return ok >= 3
+    except Exception:
+        return False
+
+
 def cursor_hover_cell(res=None):
     """返回鼠标压着的交叉点 (i, j); 不在棋盘上返回 None"""
     global LAST_RES
@@ -330,8 +359,12 @@ def anchor_turn_visual(counts, assist, res_cur):
         except Exception:
             pass
         return 'black', 'empty'
-    # 绿框视觉判定: 冷启动参考未学时按固定阈值直判(异≤0.12我方 /
-    # ≥0.14对方), 参考学会后改走两态中点分界; 不可判则重试再放弃
+    # 绿框视觉判定: 三路交叉, 不盲信单一徽章(徽章在落子后数秒滞后,
+    # 会显示上一手的行棋方)。三路: 徽章几何(geo) / 绿框异占比(obox)
+    # / 算术(黑==白->黑该走; 黑>白->白该走; 白>黑->黑该走)。
+    # 算术前提子会失真, 故只作交叉参考; 至少一路视觉有效才入票,
+    # 多数决(含算术)定轮次。徽章滞后单路不再直判, 避免误锚。
+    _other = ('white' if assist == 'black' else 'black')
     try:
         _rw = br.window_rect(br.PID)
     except Exception:
@@ -344,30 +377,73 @@ def anchor_turn_visual(counts, assist, res_cur):
             if _im is not None:
                 import numpy as _np
                 _arr = _np.asarray(_im).astype(_np.int16)
-            # 官方魔章几何优先: 楔形=白方行棋/仅弧=黑方行棋, 语义直接
+            # 算术(提子失真, 仅交叉参考)
+            if counts[0] == counts[1]:
+                _arith = 'black'
+            elif counts[0] > counts[1]:
+                _arith = 'white'
+            else:
+                _arith = 'black'
+            # 视觉两路
             _g = winclick.turn_arrow_geo(_rw, _grd, _arr)
-            if _g in ('white', 'black'):
-                print(f'  绿框徽章: {"白方" if _g=="white" else "黑方"}行棋'
-                      f'(官方真值) -> 轮到'
-                      f'{"白" if _g=="white" else "黑"}')
-                return _g, 'visual'
             _st = winclick.strip_box_stats(_rw, _grd, _arr)
+            _obox_turn = None
             if _st is not None:
                 _vc = vis_classify(_st[0])
-                if _vc in ('mine', 'opp'):
-                    _learned = (_VIS_REF['mine'] is not None
-                                and _VIS_REF['opp'] is not None)
-                    _lab = (f'参考: 我方{_VIS_REF["mine"]:.2f} '
-                            f'对方{_VIS_REF["opp"]:.2f}' if _learned
-                            else '参考未学习(冷启动), 固定阈值直判')
-                    print(f'  绿框状态: 异{_st[0]:.2f} | {_lab} -> '
-                          f'{"我方" if _vc=="mine" else "对方"}行棋')
-                    return (assist if _vc == 'mine'
-                            else _other(assist)), 'visual'
+                if _vc == 'mine':
+                    _obox_turn = assist
+                elif _vc == 'opp':
+                    _obox_turn = _other
+            # 提子场景: 子数差>1 则奇偶假设失效, 算术弃票(否则会误投错方)
+            _capture = abs(counts[0] - counts[1]) > 1
+            _arith_str = _arith if not _capture else '~(提子失真)'
+            _have_geo = _g in ('white', 'black')
+            _have_obox = _obox_turn in ('white', 'black')
+            # 至少一路视觉有效才入票; 否则重试(保留不可判->人工路径)
+            if not (_have_geo or _have_obox):
+                time.sleep(0.6)
+                continue
+            # 决策优先级:
+            #  - 无提子: 算术奇偶为地面真值; 视觉两路一致直接采信,
+            #    视觉两路矛盾时取与算术同色者(算术/另一路误判其一)。
+            #  - 有提子: 算术失效, 仅看视觉两路; 一致采信, 矛盾取 obox
+            #    (徽章落子后/启动瞬间滞后, obox 为确认信号)。
+            if not _capture:
+                if _have_geo and _have_obox and _g == _obox_turn:
+                    _turn, _tie = _g, ''
+                elif _have_geo and _have_obox:
+                    if _arith == _g:
+                        _turn, _tie = _g, ', geo=算术(obox异)'
+                    else:
+                        _turn, _tie = _obox_turn, ', obox=算术(geo异)'
+                elif _have_geo:
+                    if _arith == _g:
+                        _turn, _tie = _g, ''
+                    else:
+                        _turn, _tie = _arith, ', 仅徽章与算术矛盾取算术(奇偶)'
+                else:  # 仅 obox
+                    if _arith == _obox_turn:
+                        _turn, _tie = _obox_turn, ''
+                    else:
+                        _turn, _tie = _arith, ', 仅obox与算术矛盾取算术(奇偶)'
+            else:  # 提子: 算术失效, 仅视觉两路
+                if _have_geo and _have_obox:
+                    if _g == _obox_turn:
+                        _turn, _tie = _g, ''
+                    else:
+                        _turn, _tie = _obox_turn, ', 视觉矛盾取obox(徽章滞后)'
+                elif _have_geo:
+                    _turn, _tie = _g, ''
+                else:
+                    _turn, _tie = _obox_turn, ''
+            print(f'  锚定交叉: 徽章={_g} obox={_obox_turn} '
+                  f'算术={_arith_str}(黑{counts[0]}白{counts[1]})'
+                  f' -> 轮到{"黑" if _turn == "black" else "白"}{_tie}')
+            return _turn, 'visual'
         except Exception:
             pass
         time.sleep(0.6)
-    print('?? 绿框状态连续无法判定(读数失败或异值落在死区), 不猜奇偶;')
+    print('?? 视觉状态连续无法判定(读数失败或异值死区), 不猜奇偶;')
     print('   请确认微信窗口在前台且处于对局页, 在 UI 里选[当前轮到]后'
           '点[启动]重试')
     return None, 'unresolved'
@@ -427,12 +503,23 @@ def color_observer_loop():
 
 
 
-def analyze_position(n, stones, player, visits=None, banned=None):
+def analyze_position(n, stones, player, visits=None, banned=None,
+                     prefix=None, prefix_player=None):
     visits = visits or VISITS
+    moves = []
+    initialPlayer = player
+    analyzeTurns = [0]
+    if prefix:
+        # 接续分析: 在 initialStones 之上追加已落手(GTP 串列表), 颜色由
+        # prefix_player 起依次交替; analyzeTurns 指向最后一手之后。用于
+        # 对方思考期把"对方刚落的预测手"下进局面, 直接续算我方应手。
+        moves = [str(m) for m in prefix]
+        analyzeTurns = [len(moves)]
+        initialPlayer = prefix_player or player
     req = {
-        'id': 'play', 'moves': [], 'initialStones': stones,
-        'initialPlayer': player, 'rules': 'chinese', 'komi': 7.5,
-        'boardXSize': n, 'boardYSize': n, 'analyzeTurns': [0],
+        'id': 'play', 'moves': moves, 'initialStones': stones,
+        'initialPlayer': initialPlayer, 'rules': 'chinese', 'komi': 7.5,
+        'boardXSize': n, 'boardYSize': n, 'analyzeTurns': analyzeTurns,
         'maxVisits': visits,
     }
     _t0 = time.time()
@@ -476,41 +563,133 @@ def root_view(root, want):
 
 
 
+# 分相计时: 记录"对方落子检测 -> 我方落子确认"各阶段耗时
+_MOVE_T = {}
+
+
+def _phase_report():
+    """打印上一手从检测到确认的分相耗时(检测/算手/点击/确认)。"""
+    global _MOVE_T
+    d = _MOVE_T
+    t0 = d.get('detected')
+    if t0 is None:
+        return
+    cs = d.get('compute_start')
+    mr = d.get('mv_ready')
+    ck = d.get('click')
+    cf = d.get('confirm')
+    parts = []
+    if cs is not None:
+        parts.append('检测->算手 %.0fms' % ((cs - t0) * 1000))
+    if mr is not None and cs is not None:
+        r = '复用' if d.get('reused') else '新算'
+        parts.append('算手(%s) %.0fms' % (r, (mr - cs) * 1000))
+    if ck is not None and mr is not None:
+        parts.append('算手->点击 %.0fms' % ((ck - mr) * 1000))
+    if cf is not None and ck is not None:
+        parts.append('点击->确认 %.0fms' % ((cf - ck) * 1000))
+    if cf is not None:
+        parts.append('总计 %.0fms' % ((cf - t0) * 1000))
+    if parts:
+        print('[分相计时] ' + ' | '.join(parts))
+
+
+def _gtp_to_ij(n, mv):
+    """GTP 串(如 'J8') -> 棋盘 (行,列) 0-based; pass/非法返回 None。"""
+    if mv is None:
+        return None
+    mv = str(mv).strip()
+    if mv.lower().startswith('pass'):
+        return None
+    try:
+        col = LETTERS.index(mv[0])
+        row = n - int(mv[1:])
+        return (row, col)
+    except Exception:
+        return None
+
+
+def _prefill_after_opp(n, last_board, board, mover, assist):
+    """对手落子后用其真实落点作 prefix 续算我方应手(异步, 不阻塞检测
+    循环)。把 4-5s 冷算移到"对手落子 -> 我落子"的间隙; 我方落子时按
+    对手落子后局面 KEY 复用缓存, 零延迟出招。"""
+    try:
+        _add = game_move_added(n, last_board, board)
+        if not (_add and _add[1]):
+            return
+        _opp_gtp = _add[1]
+        _stones_before = br.stones_legal(n, last_board)
+        _mv, _info, _root = analyze_position(
+            n, _stones_before, assist, visits=VISITS,
+            prefix=[_opp_gtp], prefix_player=mover)
+        PRE['key'] = tuple(tuple(s) for s in br.stones_legal(n, board))
+        PRE['pred_move'] = _opp_gtp
+        PRE['t'] = time.time()
+        PRE['done'] = True
+        if _mv and not str(_mv).lower().startswith('pass'):
+            PRE['mv'], PRE['info'], PRE['root'] = str(_mv), _info, _root
+            print(f'[预热] 对手落 {_opp_gtp} -> 续算我方应 {_mv} '
+                  f'({VISITS}点, 缓存{len(PRE["key"])}子)')
+        else:
+            PRE['mv'] = None
+            print(f'[预热] 对手落 {_opp_gtp}, 续算无应手')
+    except Exception as e:
+        print(f'[预热] 续算异常 {type(e).__name__}: {e}')
+
+
 def pre_analyze(n, board, assist, wait):
-    """对方回合内预分析我方应手并缓存; 等待越久算力阶梯加深
-    (350 -> 800 -> 2000 -> 满配), 轮到我们时直接采用近满强度结果。
-    只影响速度不影响正确性: 盘面键不匹配/含劫争黑名单时主流程重新完整分析。"""
+    """对方回合内预测对方落点并续算我方应手(接续分析), 缓存"对方落子后
+    局面"的应手; 轮到我们且盘面匹配时零延迟复用(强度=VISITS)。
+
+    旧版失效根因: 用 assist 作 initialPlayer 分析"对方回合"局面(评估失真),
+    且缓存 key 是"对方落子前"局面 -> 与我方真正要算的"对方落子后"永远不匹配。
+    现改为:
+      1) 用正确行棋方(对方)分析当前局面, 取对方 top 落点(预测, 低算力即可);
+      2) 以"对方落该手"为前缀续算我方应手(强度=用户设定 VISITS);
+      3) 缓存 key = 对方落该手后的局面(与我方 turn 真实局面匹配)。
+    预测落点与真实不符时 key 不匹配 -> 主流程自动新算, 不退化。
+    """
+    if wait < 2:
+        return
     global PRE
-    # 预分析上限封顶 2000: 全量 8000 会与主查询排队(单引擎串行),
-    # 本机并行时吞吐 ~500 v/s, 排队双 8000 = 15-21s/手;
-    # 预分析只做预判, 定局强度由我方回合的主查询 8000 保证
-    lvl_at = (2, 5, 10)             # 等待秒数阈值(自对方落子起)
-    lvl_visits = (PRE_VISITS, 800, 2000)
-    lvl = 0
-    for i, t in enumerate(lvl_at):
-        if wait >= t:
-            lvl = i
     now = time.time()
-    if PRE.get('t') is not None and now - PRE['t'] < 4:
+    opp = ('black' if assist == 'white' else 'white')
+    stones = br.stones_legal(n, board)            # 对方落子前局面
+    key0 = tuple(tuple(s) for s in stones)
+    # 同一局面已用目标强度(VISITS)续算完成则跳过, 避免重复跑双查询
+    if (PRE.get('pred_key') == key0 and PRE.get('done') is True):
+        return
+    # 同局面 1.5s 内不重跑预测(防止 0.25s 轮询下频繁触发双查询)
+    if (PRE.get('pred_key') == key0 and now - PRE.get('t', 0) < 1.5):
         return
     try:
-        stones = br.stones_legal(n, board)
-        key = tuple(tuple(s) for s in stones)
         PRE['t'] = now
-        if (PRE.get('key') == key and PRE.get('mv')
-                and PRE.get('lvl', 0) >= lvl):
+        # 1) 正确行棋方(对方)分析当前局面 -> 预测对方落点(低算力够准)
+        mv_opp, _, _ = analyze_position(n, stones, opp, visits=PRE_VISITS)
+        if mv_opp is None or str(mv_opp).lower().startswith('pass'):
+            PRE['pred_key'], PRE['mv'], PRE['done'] = key0, None, True
+            print('[预热] 对方预测=pass/None, 不缓存')
             return
-        mv, info, root = analyze_position(n, stones, assist,
-                                          visits=lvl_visits[lvl])
-        PRE['lvl'] = lvl
+        # 2) 以"对方落该手"为前缀续算我方应手(强度=VISITS, 命中即复用)
+        mv, info, root = analyze_position(
+            n, stones, assist, visits=VISITS,
+            prefix=[str(mv_opp)], prefix_player=opp)
+        # 3) 缓存 key = 对方落该手后的局面
+        ij = _gtp_to_ij(n, mv_opp)
+        pred_board = [list(r) for r in board]
+        if ij is not None:
+            pred_board[ij[0]][ij[1]] = 'X' if opp == 'black' else 'O'
+        PRE['key'] = tuple(tuple(s) for s in br.stones_legal(n, pred_board))
+        PRE['pred_key'], PRE['pred_move'], PRE['done'] = key0, str(mv_opp), True
         if mv and not str(mv).lower().startswith('pass'):
-            PRE['key'], PRE['mv'] = key, str(mv)
-            PRE['info'], PRE['root'] = info, root
+            PRE['mv'], PRE['info'], PRE['root'] = str(mv), info, root
+            print(f'[预热] 预测对方落 {mv_opp} -> 我方应 {mv} '
+                  f'(续算{VISITS}点, 缓存{len(PRE["key"])}子)')
         else:
-            PRE['key'], PRE['mv'] = key, None
-            PRE['info'], PRE['root'] = None, None
-    except Exception:
-        pass
+            PRE['mv'] = None
+            print(f'[预热] 预测对方落 {mv_opp}, 我方续算无应手')
+    except Exception as e:
+        print(f'[预热] 异常 {type(e).__name__}: {e}')
 
 
 
@@ -943,6 +1122,13 @@ def read_board_counts():
                                 for k, c in enumerate(board[hi]))
             board = [''.join(r) for r in board]
             res['board'] = board
+        elif _hover_square(res, hi, hj):
+            # 光标下方块被读成我方子(布局方块>=14px 时): 屏蔽为 '?'。
+            # 圆棋子四角为木色不会命中, 我方刚落子的真子不受影响。
+            board = [list(r) for r in res['board']]
+            board[hi] = ''.join(c if k != hj else '?'
+                                for k, c in enumerate(board[hi]))
+            res['board'] = [''.join(r) for r in board]
     LAST_RES = res
     n, board = res['n'], res['board']
     counts = (sum(r.count('X') for r in board),
@@ -1502,7 +1688,20 @@ def main():
                         print(f'检测到落子 -> 盘面黑{counts[0]}白{counts[1]}, '
                               f'轮到{("黑" if turn=="black" else "白")}')
                         evt('检测到落子')
+                        global _MOVE_T
+                        _MOVE_T = {'detected': time.time()}
                         _vis_flipped = False
+                        if mover != assist:
+                            # 对手落子后, 立即用其真实落点作 prefix 续算我方
+                            # 应手(异步线程, 不阻塞检测循环)。把 4-5s 冷算移到
+                            # "对手落子 -> 我落子"的间隙完成; 我方落子时按对手
+                            # 落子后局面 KEY 复用缓存, 零延迟出招。
+                            import threading as _th
+                            _th.Thread(
+                                target=_prefill_after_opp,
+                                args=(n, list(map(list, LAST_BOARD)),
+                                      list(map(list, board)), mover, assist),
+                                daemon=True).start()
                         move_no += 1
                         _set_st(turn=turn, b=counts[0], w=counts[1],
                                 move_no=move_no, status='wait', mv='')
@@ -1590,6 +1789,20 @@ def main():
                             _wcls = ('mine' if _resw == assist
                                      else 'opp')  # geo: 白/黑行棋 -> mine/opp
                             _wf = None
+                            # 高风险翻回合双保险: geo 单独说"我方行棋"很可能是
+                            # 徽章横幅滞后(我方刚落子后箭头仍指向我方)。要求
+                            # 独立信号 obox(异占比两态, 异高=对方回合)也判"我方"
+                            # 才采信; 两路矛盾视为滞后/误判, 不翻回合, 避免误点错手。
+                            if _wcls == 'mine':
+                                try:
+                                    _stb = winclick.strip_box_stats(
+                                        _rw2, _grd2, _arr2)
+                                    if _stb is not None:
+                                        _obc = vis_classify(_stb[0])
+                                        if _obc != 'mine':
+                                            _wcls = None
+                                except Exception:
+                                    pass
                         elif _srcw == 'obox':
                             _wcls = _resw
                             _wf = float(_infow.split('异')[1])
@@ -1896,23 +2109,35 @@ def main():
                 forced = []  # 读盘漏子时手动标记的占位点
                 for attempt in range(3):
                     stones = br.stones_legal(n, board) + forced
+                    if attempt == 0 and 'compute_start' not in _MOVE_T:
+                        _MOVE_T['compute_start'] = time.time()
                     # 优先采用对方回合预分析结果(同局面且未被禁), 免等引擎
                     mv = info = root = None
                     if not forced:
                         _k = tuple(tuple(s) for s in stones)
-                        if (PRE.get('key') == _k and PRE.get('mv')
+                        _hit = (PRE.get('key') == _k and PRE.get('mv')
                                 and PRE['mv'] not in bad_points
-                                and time.time() - PRE.get('t', 0) < 90):
+                                and time.time() - PRE.get('t', 0) < 90)
+                        if _hit:
                             mv = PRE['mv']
                             info = PRE['info']
                             root = PRE['root']
+                            _MOVE_T['reused'] = True
+                        elif PRE.get('pred_move') is not None:
+                            print(f'[预热] 未命中: 预测对方落 '
+                                  f'{PRE.get("pred_move")} 与真实不符 '
+                                  f'(key差{1 if PRE.get("key")!=_k else 0})')
+                            PRE['pred_move'] = None  # 避免重复打印
                     if mv is None:
                         mv, info, root = analyze_position(n, stones, assist,
                                         banned=bad_points)
+                        _MOVE_T['reused'] = False
                     if mv is None:
                         print('KataGo 无返回, 稍后重试')
                         time.sleep(3)
                         break
+                    if 'mv_ready' not in _MOVE_T:
+                        _MOVE_T['mv_ready'] = time.time()
                     if str(mv).lower().startswith('pass'):
                         # 仅在"我方大优收局"或盘面接近下满时才终局流程
                         # 引擎胜率为黑方基准(cfg), 先换算成我方视角再门控
@@ -2142,6 +2367,7 @@ def main():
                         br.align_reset()
                         time.sleep(0.3)
                         break
+                    _MOVE_T['click'] = time.time()
                     click_at(rx, ry)
                     my_char = 'X' if assist == 'black' else 'O'
                     ok_move = False
@@ -2162,6 +2388,8 @@ def main():
                                   else (counts3[1] - counts[1]))
                         if placed or my_inc >= 1:
                             ok_move = True
+                            _MOVE_T['confirm'] = time.time()
+                            _phase_report()
                             break
                     if not ok_move:
                         # 重试前快查: 盘面若已变化(我方子其实已出现/对方刚

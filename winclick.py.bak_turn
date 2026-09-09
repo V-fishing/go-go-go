@@ -384,6 +384,79 @@ def _scan_side_disc(img, x0, x1, y0, y1, step=5, win=28):
     return best
 
 
+def avatar_indicators_dynamic(rect):
+    """布局自适应: 顶带(标题下~棋盘上)全局扫描紧凑圆斑, 按左右半区分侧,
+    组合选出一黑一白的一对(头像/文字伪影用紧凑校验+配对排除)。
+    角标棋子随对局上下浮动较大, 本方法不依赖固定框。"""
+    from PIL import ImageGrab
+    import board_reader as _br
+    try:
+        g = _br.read_current(do_align=False, use_calib=False)
+        board_top = int(g['ys'][0] - g.get('step', 27) * 0.6) if g else 250
+    except Exception:
+        board_top = 250
+    W = rect[2] - rect[0]
+    img = ImageGrab.grab(bbox=rect).convert('RGB')
+    y_bot = min(img.size[1] - 16, max(120, board_top - 8))
+    left, right = [], []
+    for y in range(75, y_bot, 5):
+        for x in range(12, W - 40, 5):
+            crop = img.crop((x, y, x + 28, y + 28))
+            c = classify_avatar_box(crop)
+            if c is None or not _blob_compact(crop, c):
+                continue
+            sc = _disc_score(crop)
+            hit = (c, sc, x + 14, y + 14)
+            (left if x + 14 < W // 2 else right).append(hit)
+    # 聚类 + 按分数排序
+    def dedup(lst):
+        out = []
+        for h in sorted(lst, key=lambda h: -h[1]):
+            if all(abs(h[2]-o[2]) > 22 or abs(h[3]-o[3]) > 22 for o in out):
+                out.append(h)
+            if len(out) >= 6:
+                break
+        return out
+    L, R = dedup(left), dedup(right)
+    # 头像圆: 取带内面积最大的两个(左右各一)
+    import cv2
+    import numpy as np
+    gray = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray[70:y_bot, :], 40, 120)
+    circ = cv2.HoughCircles(edges, cv2.HOUGH_GRADIENT, dp=1.1, minDist=110,
+                            param1=80, param2=24, minRadius=16, maxRadius=52)
+    avs = []
+    if circ is not None:
+        for cx, cy, r in np.round(circ[0]).astype(int):
+            avs.append((cx, cy + 70, r))
+        avs.sort(key=lambda a: -(a[2] ** 2))
+        avs = avs[:4]
+    if len(avs) >= 2:
+        # 我方角标贴我方头像右上角; 对方贴其头像左上角(官方几何)
+        av_l = min(avs, key=lambda a: a[0])
+        av_r = max(avs, key=lambda a: a[0])
+        picks = []
+        for av, corner_x, zone in ((av_l, 1, L), (av_r, -1, R)):
+            ax, ay, ar = av
+            cxp = ax + corner_x * int(ar * 0.72)
+            cyp = ay - int(ar * 0.72)
+            best = None
+            for c, sc, x, y in zone:
+                d = (x - cxp) ** 2 + (y - cyp) ** 2
+                if d < (ar * 0.62) ** 2 and (best is None or d < best[0]):
+                    best = (d, c)
+            if best:
+                picks.append(best[1])
+        if len(picks) == 2 and picks[0] != picks[1]:
+            return picks[0], picks[1]
+    # 兜底: 左右各取一、颜色不同即命中(分数高者优先)
+    for l in L:
+        for r in R:
+            if l[0] != r[0]:
+                return l[0], r[0]
+    return None
+
+
 def _strip_my_color(rect, img=None, a=None):
     """竖条法读我方角标颜色(用户规格):
     角标只沿 y 漂移 => 在我方校准框中心 x 附近(±16, 步4)取窄竖条(宽18),
@@ -397,7 +470,7 @@ def _strip_my_color(rect, img=None, a=None):
     if a is None:
         a = np.asarray(img).astype(np.int16)
     try:
-        myb = avatar_my_box()
+        myb = avatar_calib_boxes()[0]
     except Exception:
         return None
     xc = (myb[0] + myb[2]) // 2 - rect[0]
@@ -457,6 +530,57 @@ def avatar_indicators_vstrip(rect):
     return my
 
 
+def read_avatar_indicators():
+    """官方头像角标读取: 返回 (我方颜色, 对方颜色或None) 或 None。
+    我方为唯一准则: 我方框读出即采信; 对方框仅尽力读(异常帧=同色才丢弃)。"""
+    from PIL import ImageGrab
+    import numpy as np
+    rect = None
+    try:
+        import board_reader as br
+        rect = br.window_rect(br.PID)
+    except SystemExit:
+        return None
+    boxes = avatar_calib_boxes()
+    if boxes is None:
+        return None
+    pairs = []
+    for _ in range(2):
+        img = ImageGrab.grab(bbox=rect).convert('RGB')
+        cls = []
+        for idx in range(2):
+            b = boxes[idx]
+            # avatar_calib_boxes 给的是屏幕坐标, 截图是窗口相对 -> 换算
+            x0, y0 = b[0] - rect[0], b[1] - rect[1]
+            crop = img.crop((x0, y0, b[2] - rect[0], b[3] - rect[1]))
+            c = classify_avatar_box(crop)
+            if c is None:
+                # 邻域自愈: 角标位置随对局布局漂移(可达±20px), 滑动找最强单色块
+                bw, bh = b[2] - b[0], b[3] - b[1]
+                best, best_score = None, 0.0
+                for dy in range(-24, 25, 6):
+                    for dx in range(-24, 25, 6):
+                        cx0, cy0 = x0 + dx, y0 + dy
+                        crop2 = img.crop((cx0, cy0, cx0 + bw, cy0 + bh))
+                        sc = _disc_score(crop2)
+                        c2 = classify_avatar_box(crop2)
+                        if c2 and sc > best_score:
+                            best, best_score = c2, sc
+                if best is not None:
+                    c = best
+            cls.append(c)
+        # 只认我方: 我方可读即采信; 对方读到的颜色与我方相同视为异常帧
+        if cls[0] is not None and (cls[1] is None or cls[0] != cls[1]):
+            pairs.append((cls[0], cls[1]))
+        time.sleep(0.15)
+    if not pairs:
+        return None
+    # 多帧一致取多数; 两帧矛盾放弃(防呆)
+    if len(pairs) >= 2 and pairs[0][0] != pairs[1][0]:
+        return None
+    return pairs[0]
+
+
 def _disc_score(img):
     """分类置信: 优势色的占比(用于邻域滑动选最优)"""
     import numpy as np
@@ -491,6 +615,80 @@ def _avatar_centers(rect, a, y_top=60, y_bot=None):
     return out
 
 
+def _my_color_by_geometry(rect):
+    """几何法(用户规格): 我方棋子 = 头像在其负 x 侧(左侧)的那颗。
+    扫描整条顶带找紧凑棋子段(记录中心), 与头像圆配对:
+    存在 头像.cx < 棋子.x 且 距离/垂直差 合理 => 该棋子为我方, 取其颜色。
+    对方棋子(头像在其右侧)自然被排除; 无头像/无棋子返回 None。"""
+    import numpy as np
+    from PIL import ImageGrab
+    img = ImageGrab.grab(bbox=rect).convert('RGB')
+    a = np.asarray(img).astype(np.int16)
+    lum = a.mean(axis=2)
+    chroma = a.max(axis=2) - a.min(axis=2)
+    try:
+        import board_reader as _br
+        g = _br.read_current(do_align=False, use_calib=False)
+        y_bot = min(a.shape[0] - 10,
+                    int(g['ys'][0] - g.get('step', 27) * 0.6)) if g else 250
+    except Exception:
+        y_bot = 250
+    # 1) 全宽扫列, 记录每列最强棋子段 (x, 颜色, 高, 中心y)
+    cols = []
+    for x in range(15, a.shape[1] - 15, 3):
+        best = None
+        cur = None
+        y_start = 0
+        for y in range(55, max(56, y_bot - 4)):
+            wl = lum[y, x - 9:x + 9]
+            c2 = chroma[y, x - 9:x + 9]
+            if float(((wl < 90) & (c2 < 60)).mean()) > 0.45:
+                col = 'black'
+            elif float(((wl > 246) & (c2 < 40)).mean()) > 0.45:
+                col = 'white'
+            else:
+                cur = None
+                continue
+            if cur and cur[0] == col:
+                cur = (col, cur[1] + 1)
+            else:
+                cur = (col, 1)
+                y_start = y
+            if 8 <= cur[1] <= 32 and (best is None or cur[1] > best[1]):
+                best = (col, cur[1], (y_start + y) // 2)
+        if best:
+            cols.append((x, best[0], best[1], best[2]))
+    # 2) 聚类相邻列(同一颗棋子)
+    stones = []
+    for x, col, h, sy in cols:
+        if stones and x - stones[-1][0] < 26:
+            if h > stones[-1][2]:
+                stones[-1] = (x, col, h, sy)
+        else:
+            stones.append([x, col, h, sy])
+    if not stones:
+        return None
+    # 3) 头像圆
+    avs = _avatar_centers(rect, a, y_bot=y_bot)
+    if not avs:
+        return None
+    # 4) 我方角标在"头像右上角": 棋子相对头像 向右(dx>0)且向上(dy<0),
+    #    距离约为头像半径量级(贴边); 不符合则不是我方角标(返回 None 更安全)
+    for sx, col, h, sy in stones:
+        for ax, ay, ar in avs:
+            dx = sx - ax
+            dy = sy - ay
+            if dx <= 0 or dy >= 0:
+                continue
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist > ar * 1.45 or dist < ar * 0.35:
+                continue
+            if abs(dx) > 110 or abs(dy) > 110:
+                continue
+            return col
+    return None
+
+
 def _my_stone_color_only(rect):
     """只识别我方执子 —— 严格按"中心竖线穿过持子"的几何:
     仅取校准中心 xc±6px 的窄竖条, 沿 y 扫描该色连续段(8-26px)。
@@ -498,7 +696,7 @@ def _my_stone_color_only(rect):
     import numpy as np
     from PIL import ImageGrab
     try:
-        myb = avatar_my_box()
+        myb = avatar_calib_boxes()[0]
     except Exception:
         return None
     xc = (myb[0] + myb[2]) // 2 - rect[0]
@@ -785,7 +983,7 @@ def _my_stone_vote(rect):
     适配"角标棋子小+亮色头像底"布局(竖条几何/配对法在此失效)。"""
     from PIL import ImageGrab
     try:
-        myb = avatar_my_box()
+        myb = avatar_calib_boxes()[0]
     except Exception:
         return None
     votes = []
@@ -826,6 +1024,9 @@ def avatar_my_color():
     v = avatar_indicators_vstrip(rect)
     if v is not None:
         return v
+    r = read_avatar_indicators()
+    if r:
+        return r[0]
     return None
 
 

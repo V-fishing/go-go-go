@@ -4,11 +4,10 @@
 用法: 1) 把腾讯围棋切到对局画面(能看到双方头像与角标棋子)
       2) python avatar_calib.py
       3) 点 [框选我方角标] 在我方头像右上角的棋子外拖一个小框
-      4) 点 [框选对方角标] 在对方头像左上角的棋子外拖一个小框
-      5) 点 [实时检测] 验证识别结果(显示 我方执X / 对方执X)
-      6) 点 [保存校准] 写入 avatar_calib.json
+      4) 点 [实时检测] 验证识别结果(显示 我方执X)
+      5) 点 [保存校准] 写入 avatar_calib.json
 
-之后 winclick/katago_play 优先用官方角标判定执色(比试探/观察法可靠)。
+之后 winclick/katago_play 只用官方"我方角标"判定执色(不识别对方角标)。
 """
 import json
 import os
@@ -26,14 +25,13 @@ import winclick
 
 CALIB = os.path.join(TOOLS, 'avatar_calib.json')
 C_MY = '#ff4040'      # 我方框: 红
-C_OPP = '#00b050'     # 对方框: 绿
 HUD_C = '#0000cc'
 
 
 class AvatarCalib:
     def __init__(self):
-        self.mode = None          # 'my' / 'opp'
-        self.boxes = {'my': None, 'opp': None}   # 窗口像素坐标
+        self.mode = None          # 'my'
+        self.boxes = {'my': None}   # 窗口像素坐标
         self.last_key = None          # 最近编辑的框(my/opp)
         self._drag = None
         self.win_rect = None
@@ -45,8 +43,6 @@ class AvatarCalib:
         bar.pack(side='bottom', fill='x', pady=4)
         tk.Button(bar, text='框选我方角标', bg='#ffcccc',
                   command=lambda: self.set_mode('my')).pack(side='left', padx=2)
-        tk.Button(bar, text='框选对方角标', bg='#ccffcc',
-                  command=lambda: self.set_mode('opp')).pack(side='left', padx=2)
         tk.Button(bar, text='重截(R)', command=self.recapture).pack(side='left', padx=6)
         tk.Button(bar, text='实时检测(T)', command=self.live_test,
                   bg='#ffffcc').pack(side='left', padx=6)
@@ -95,8 +91,7 @@ class AvatarCalib:
     def set_mode(self, m):
         self.mode = m
         self.status.config(
-            text='请在%s头像的角标棋子上拖一个小框'
-                 % ('我方' if m == 'my' else '对方'))
+            text='请在我方头像的角标棋子上拖一个小框')
 
     def on_down(self, e):
         self._drag = (e.x / self.scale, e.y / self.scale)
@@ -135,18 +130,17 @@ class AvatarCalib:
     def redraw(self):
         for t in ('box_my', 'box_opp'):
             self.cv.delete(t)
-        for key, col in (('my', C_MY), ('opp', C_OPP)):
-            b = self.boxes[key]
-            if b:
-                x0, y0, x1, y1 = b
-                self.cv.create_rectangle(x0 * self.scale, y0 * self.scale,
-                                         x1 * self.scale, y1 * self.scale,
-                                         outline=col, width=2, tags='box_' + key)
-                self.cv.create_text(
-                    x0 * self.scale, max(2, y0 * self.scale - 6), anchor='sw',
-                    text=('我方' if key == 'my' else '对方'),
-                    fill=col, font=('Microsoft YaHei', 10, 'bold'),
-                    tags='box_' + key)
+        b = self.boxes['my']
+        if b:
+            x0, y0, x1, y1 = b
+            self.cv.create_rectangle(x0 * self.scale, y0 * self.scale,
+                                     x1 * self.scale, y1 * self.scale,
+                                     outline=C_MY, width=2, tags='box_my')
+            self.cv.create_text(
+                x0 * self.scale, max(2, y0 * self.scale - 6), anchor='sw',
+                text='我方',
+                fill=C_MY, font=('Microsoft YaHei', 10, 'bold'),
+                tags='box_my')
 
     # ---------- 放大预览 ----------
     def _clear_zoom(self):
@@ -182,50 +176,44 @@ class AvatarCalib:
             return None
 
     def check_live(self):
-        if not (self.boxes['my'] and self.boxes['opp']):
+        if not self.boxes['my']:
             return
         m = self._classify_now('my')
-        o = self._classify_now('opp')
         sm = '黑' if m == 'black' else ('白' if m == 'white' else '?')
-        so = '黑' if o == 'black' else ('白' if o == 'white' else '?')
-        ok = (m in ('black', 'white') and o in ('black', 'white')
-              and m != o)
-        txt = f'实时识别: 我方角标={sm}  对方角标={so}'
+        ok = m in ('black', 'white')
+        txt = f'实时识别: 我方角标={sm}'
         if ok:
             txt += f'   => 我方执{("黑" if m=="black" else "白")}  ✔ 可保存'
             self.status.config(text=txt, fg='#006600')
         else:
-            txt += '  (未同时识别出一黑一白, 请调整框的位置/大小)'
+            txt += '  (未识别到黑/白, 请调整框的位置/大小)'
             self.status.config(text=txt, fg='#cc0000')
 
     # ---------- 实时检测 ----------
     def live_test(self):
-        if not (self.boxes['my'] and self.boxes['opp']):
-            self.status.config(text='请先框选我方与对方角标')
+        if not self.boxes['my']:
+            self.status.config(text='请先框选我方角标')
             return
         self.save(quiet=True)
-        res = winclick.read_avatar_indicators()
-        if res:
-            my, opp = res
+        my = winclick.avatar_my_color()
+        if my:
             self.status.config(
-                text=f'✔ 实时检测: 我方执{("黑" if my=="black" else "白")}  '
-                     f'对方执{("黑" if opp=="black" else "白")}')
+                text=f'✔ 实时检测: 我方执{("黑" if my=="black" else "白")}')
         else:
             self.status.config(text='✘ 检测失败(框没对准棋子?), 调整后重试')
 
     # ---------- 保存 ----------
     def save(self, quiet=False):
-        if not (self.boxes['my'] and self.boxes['opp']):
-            self.status.config(text='请先框选我方与对方角标')
+        if not self.boxes['my']:
+            self.status.config(text='请先框选我方角标')
             return
         x0, y0, x1, y1 = self.win_rect
         data = {'win_w': self.iw, 'win_h': self.ih,
-                'my': list(self.boxes['my']),
-                'opp': list(self.boxes['opp'])}
+                'my': list(self.boxes['my'])}
         json.dump(data, open(CALIB, 'w'))
         if not quiet:
             self.status.config(
-                text=f'✔ 已保存 {CALIB}  我方={data["my"]} 对方={data["opp"]}')
+                text=f'✔ 已保存 {CALIB}  我方={data["my"]}')
             print('已保存:', CALIB, data)
 
     def on_key(self, e):
@@ -264,7 +252,7 @@ from PIL import ImageGrab  # noqa: E402
 def main():
     app = AvatarCalib()
     app.status.config(text='先点 [框选我方角标], 在我方头像右上角的棋子上拖框; '
-                           '再框选对方(左上角)')
+                           '只识别我方角标即可判定执色')
     app.root.mainloop()
 
 
