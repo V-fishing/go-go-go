@@ -853,6 +853,44 @@ def page_no_game_reason():
     return None
 
 
+def _resolve_new_game_turn(assist, total, samples=6, gap=0.5):
+    """新局重置时确定 turn。
+
+    盘面为空(0子): 黑先手, turn='black'(原逻辑)。
+    盘面非空: 说明对方可能已落首手(该盘面会被设为 last_counts 基线, 此后
+    counts 恒等于基线而永不触发落子检测), 此时绝不能用"空盘黑先"假设, 否则
+    turn 会永久停在 black —— 表现为"轮到我方(金框/角标均正确)却不落子"的
+    静默卡死。改用金框(谁行棋)判定: 金框=我方 -> turn=assist, 否则对方。
+    多次采样取中位数, 抗开局瞬时金色 UI 假阳性。
+    """
+    if total <= 0:
+        return 'black'
+    try:
+        import winclick as _wc
+        import board_reader as _br
+        _rw = _br.window_rect(_br.PID)
+    except Exception:
+        return 'black'
+    _gfs = []
+    for _i in range(samples):
+        try:
+            _gf = _wc.gold_frame_ratio(_rw, None)
+            if _gf is not None:
+                _gfs.append(_gf)
+        except Exception:
+            pass
+        time.sleep(gap)
+    if not _gfs:
+        print('  [新局轮次] 金框采样失败, 退回黑先')
+        return 'black'
+    _gfs.sort()
+    _med = _gfs[len(_gfs) // 2]
+    _t = assist if _med >= _wc.GOLD_THR else other(assist)
+    print(f'  [新局轮次] 金框中位={_med:.3f} (盘面{total}子) -> '
+          f'轮到{"黑" if _t == "black" else "白"}')
+    return _t
+
+
 def end_or_wait(msg):
     """终局/异常出口: 打印原因; wait_new 模式下自动点[重新匹配/续战]进入下一盘,
     返回新局读数 (n,board,counts,res); 否则返回 None(停止)。"""
@@ -881,6 +919,14 @@ def end_or_wait(msg):
             GAME_MOVES.clear()      # 新局另起 SGF 记录
             GAME_LAST_KEY = None
             CAP_HOLD = 0.0
+            KO_BAN['point'] = None  # 新局清劫禁(防跨局残留)
+            KO_BAN['seq'] = -1
+            # 新局清空趋势数据: 否则旧局记录残留, 且新局手数从0重来会让
+            # 趋势折线横跳(旧局尾 -> 新局头), 图上出现无意义的大跳变。
+            try:
+                open(TREND_FILE, 'w', encoding='utf-8').close()
+            except Exception:
+                pass
             GAMES_DONE += 1
             if MAX_GAMES and GAMES_DONE >= MAX_GAMES:
                 print(f'!! 已达设定局数上限({MAX_GAMES}盘), 停止')
@@ -957,6 +1003,12 @@ def scan_popups():
     if '重连' in J and '对局已结束' in J:
         if click('确定', 'reconnect_end', '重连成功-对局已结束'):
             return 'reconnect_end'
+    if '匹配超时' in J and '重新匹配' in J:
+        # 匹配超时提示: 一律点[确定](重新匹配), 继续等待新局。
+        # 实测该弹窗按钮文案为"确定"(非"确认"), 且另有"取消"按钮, 须精确匹配
+        # "确定"以免误点取消。
+        if click('确定', 'match_timeout', '匹配超时-重新匹配'):
+            return 'match_timeout'
     return None
 
 
@@ -1057,6 +1109,10 @@ MY_SIDE = None           # 我方执色(启动时由 main 设置, 记录用)
 
 GAME_MOVES = []       # 本局着法(终局写 SGF): {'no','c'(X/O),'mv','n',+bw/lead}
 GAME_LAST_KEY = None  # 已记录着法后的盘面键(防同手重复记录)
+# 劫禁(手顺法): 'point'=对方上一手恰好提我方1子的被提点(GTP),
+# 'seq'=该禁令生效的我方落子回合序号(仅该回合禁, 下回合自动解禁)。
+# 模块级(跨局/主循环与 end_or_wait 共享); 改动字典内容无需 global。
+KO_BAN = {'point': None, 'seq': -1}
 LAST_BOARD = None     # 上一已确认盘面(推算对方落点)
 CAP_HOLD = 0.0        # 最近一次含提子的变化接受时刻(动画稳定窗口)
 SETTLE_S = 0.6        # 稳定窗口: 该时段内提交分析前须重读一次盘核对
@@ -1387,6 +1443,12 @@ def main():
     bad_points = set()      # 被拒落点黑名单(劫争等), 盘面变化时清空
     ko_state = {'point': None, 'turn': -1}  # 劫点及被禁的我方回合序号
     my_turn_seq = 0         # 每进入我方落子分支自增, 约束劫禁只限当回合
+    # 劫禁(手顺法, 主防线): 记录"对方上一手恰好提我方1子"的被提点; 该点本回合
+    # 禁落(提回会重现局面=劫规禁止)。比几何 detect_ko 可靠——不依赖劫形识别,
+    # 直接反映真实手顺, 可覆盖边线/非标准劫形(几何法易漏判)。
+    # 注意: 只重置字段(共享模块级 KO_BAN, 勿重新绑定为局部)
+    KO_BAN['point'] = None
+    KO_BAN['seq'] = -1
     _last_err = {}          # 异常去抖
 
     # 角标持续采样后台线程(并行观察, 仅记录; 真值确认后再并入判定)
@@ -1597,6 +1659,12 @@ def main():
                         # 下一手必是对方(横幅判定已取消, 不依赖 OCR)
                         mover = 'black' if db >= 1 else 'white'
                         turn = other(mover)
+                        # 对方落子后轮到我方: 我方本回合尚未行动, 重置"已行动"
+                        # 标记, 确保落子门(turn==assist and counts!=acted_counts)
+                        # 一定放行。否则若 acted_counts 因故残留为当前盘面值,
+                        # 会出现"轮到我却不落子"的静默卡死。
+                        if turn == assist:
+                            acted_counts = (-1, -1)
                         TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
                         print(f'[锁帧] 回合锁定{TURN_LOCK_SECS:.0f}s(对方落子) '
                               f'期间忽略视觉翻回合, 防金框滞后误翻')
@@ -1607,6 +1675,25 @@ def main():
                         # 提子动画稳定窗口: 任一方子数减少 => 本手含提子
                         if db < 0 or dw < 0:
                             CAP_HOLD = time.time()
+                            # 劫禁(手顺): 对方恰好提我方1子 -> 该被提点本回合禁
+                            # (提回会重现局面)。提>=2子不是劫(提回不重现), 不禁。
+                            if mover != assist:
+                                _mc = 'X' if assist == 'black' else 'O'
+                                _cap = []
+                                if len(LAST_BOARD) == n:
+                                    for _y in range(n):
+                                        for _x in range(n):
+                                            if (LAST_BOARD[_y][_x] == _mc
+                                                    and board[_y][_x] == '.'):
+                                                _cap.append((_y, _x))
+                                if len(_cap) == 1:
+                                    _cy, _cx = _cap[0]
+                                    KO_BAN['point'] = (LETTERS[_cx]
+                                                       + str(n - _cy))
+                                    # 下一次进入我方落子分支时(序号+1)生效
+                                    KO_BAN['seq'] = my_turn_seq + 1
+                                    print(f'[劫禁] 对方提我方1子 '
+                                          f'@{KO_BAN["point"]}, 本回合禁提回')
                         print(f'检测到落子 -> 盘面黑{counts[0]}白{counts[1]}, '
                               f'轮到{("黑" if turn=="black" else "白")}')
                         evt('检测到落子')
@@ -1651,7 +1738,10 @@ def main():
                       f'| 盘面黑{counts[0]}白{counts[1]} | '
                       f'我方={("黑" if assist=="black" else "白")}'
                       + (f' | 对方已思考{int(now-last_change)}s'
-                         if turn != assist else ''))
+                         if turn != assist else '')
+                      + f' | acted={acted_counts}'
+                      + (' (可落子)' if (turn == assist
+                                         and counts != acted_counts) else ''))
                 # 画面停滞提示: 等待超 90s 且绿框信号 60s 未变 =>
                 # 微信窗口大概率后台冻结(不重绘), 提醒用户检查
                 if turn != assist and now - last_change > 90:
@@ -1715,7 +1805,10 @@ def main():
                         last_counts = counts
                         last_n = n
                         acted_counts = (-1, -1)
-                        turn = 'black'
+                        # 新局盘面非空时不能用"空盘黑先"(对方可能已落首手且
+                        # 被设为基线), 用金框判定, 防 turn 停错导致不落子
+                        turn = _resolve_new_game_turn(
+                            assist, counts[0] + counts[1])
                         cand = None
                         last_activity = time.time()
                         failed_cycles = 0
@@ -2026,6 +2119,12 @@ def main():
                 # 劫争检测: 我方即将提劫但该点本回合被劫规禁止(须先找劫材),
                 # 主动把劫点加入黑名单, 让引擎改选他处; 下一回合(对手已应)解禁。
                 my_turn_seq += 1
+                # 劫禁(手顺法, 主防线): 对方刚提我方1子 -> 该点本回合禁, 让引擎
+                # 直接跳过劫点, 不必等"点了被拒再拉黑"(省掉整轮重试+重算耗时)。
+                if KO_BAN.get('point') and KO_BAN.get('seq') == my_turn_seq:
+                    bad_points.add(KO_BAN['point'])
+                    print(f'[劫禁] 本回合禁 {KO_BAN["point"]}'
+                          f'(对方刚提子, 提回会重现局面)')
                 _kko = br.detect_ko(n, board, 'X' if assist == 'black' else 'O')
                 if _kko is not None:
                     if ko_state['point'] == _kko and ko_state['turn'] == my_turn_seq:
@@ -2124,7 +2223,9 @@ def main():
                         n, board, counts, res_cur = g2
                         last_counts = counts
                         acted_counts = (-1, -1)
-                        turn = 'black'
+                        # 同上: 新局盘面非空用金框判定 turn
+                        turn = _resolve_new_game_turn(
+                            assist, counts[0] + counts[1])
                         cand = None
                         last_activity = time.time()
                         failed_cycles = 0
@@ -2315,7 +2416,38 @@ def main():
                         my_inc = ((counts3[0] - counts[0]) if
                                   assist == 'black'
                                   else (counts3[1] - counts[1]))
-                        if placed or my_inc >= 1:
+                        # 标记信号: 点击前该点(board[i][col])为空, 落子成功后
+                        # 腾讯显示"最后一手"彩色标记覆盖该点; 读盘可能因标记
+                        # 遮挡读不到 my_char。判成功须**同时**满足:
+                        #   1) 高彩(cf>=0.25)
+                        #   2) 有棋子(暗>=0.30 黑子 或 亮>=0.30 白子)
+                        # 关键: 不能只看高彩! 棋盘木色底本身 RGB 差 >60, 空点
+                        # 天然高彩(N3 空点实测 彩0.94 暗0.06 亮0.00)。若仅凭
+                        # cf>=0.25 判成功, 任何空点/被劫禁拒绝的点都会被误判
+                        # 成"落子成功"(没落上也当落了), 后果远重于漏判。
+                        # 故必须有"有子"硬条件: 空点/拒绝(无子) => mark=False。
+                        _mark = False
+                        if board[i][col] == '.':
+                            try:
+                                from PIL import ImageGrab
+                                import numpy as _np
+                                _im = ImageGrab.grab(
+                                    bbox=res_cur['rect']).convert('RGB')
+                                _a = _np.asarray(_im).astype(int)
+                                _gx, _gy = int(xs[col]), int(ys[i])
+                                _h = max(6, int(res_cur.get('step', 27)
+                                                * 0.55))
+                                _c = _a[_gy-_h:_gy+_h+1, _gx-_h:_gx+_h+1]
+                                _chm = (_c.max(axis=2) - _c.min(axis=2))
+                                _lum = _c.mean(axis=2)
+                                _cf = float((_chm > 60).mean())
+                                _df = float(((_lum < 92) & (_chm < 60)).mean())
+                                _bf = float(((_lum > 238) & (_chm < 40)).mean())
+                                if _cf >= 0.25 and (_df >= 0.30 or _bf >= 0.30):
+                                    _mark = True
+                            except Exception:
+                                pass
+                        if placed or my_inc >= 1 or _mark:
                             ok_move = True
                             _MOVE_T['confirm'] = time.time()
                             _phase_report()
@@ -2393,12 +2525,15 @@ def main():
                         # 注: detect_ko 因 board_reader 内一处死条件(XO in
                         # ('.X','X.') 单字符永不等于双字符)永远返回 None, 劫禁
                         # 预检从未生效; 故用落子被拒兜底作为主防线更稳妥。
-                        bad_points.add(mv)
-                        PRE['done'] = False
-                        PRE['mv'] = None
-                        print(f'!! 落子未确认, 把 {mv} 加入黑名单并重算'
-                              f'(疑似劫禁/禁入点)')
-                        time.sleep(0.5)
+                        # 仅当连续2次(最终)均失败才拉黑, 单次失败先重试,
+                        # 避免落子成功标记遮挡造成的单次假阴性误伤该点。
+                        if attempt == 1:
+                            bad_points.add(mv)
+                            PRE['done'] = False
+                            PRE['mv'] = None
+                            print(f'!! 落子未确认, 把 {mv} 加入黑名单并重算'
+                                  f'(疑似劫禁/禁入点)')
+                            time.sleep(0.5)
                         continue
                     # 成功: 吸收己方落子造成的盘面变化
                     delta = (counts3[0] + counts3[1]) - total

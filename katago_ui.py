@@ -505,12 +505,16 @@ class KatagoUI:
                            font=('Consolas', 8), fill='#888')
         my = self._trend[-1].get('my', 'black') or 'black'
         ms = [r['m'] for r in self._trend]
-        # 视角: 黑方视角直接黑胜率; 我方视角按执色换算
+        # 视角: 黑方视角直接黑胜率; 我方视角按执色换算。
+        # 关键: 每条记录按**它自己**的 my 换算! 跨局(分先轮换)时各段执色不同
+        # (文件里同时存在 my=black/white), 若统一用最后一条的 my 换算全部历史
+        # 点, 会把执色不同的前段数据镜像翻转(我方胜率显示反)。
         vals = []
         for r in self._trend:
             bw = max(0.0, min(100.0, r['bw']))
+            r_my = r.get('my', 'black') or 'black'
             if self._trend_my:
-                vals.append(bw if my == 'black' else 100.0 - bw)
+                vals.append(bw if r_my == 'black' else 100.0 - bw)
             else:
                 vals.append(bw)
         m0, m1 = ms[0], ms[-1]
