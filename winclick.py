@@ -572,7 +572,6 @@ def _my_stone_color_only(rect):
 _top_cache = [None, 0.0]   # 棋盘上沿缓存 [值, 时间戳](无网格提示时复用)
 
 
-
 def _chip_bounds(rect, grid, H):
     """绿框竖线带几何: 返回 (x0, x1, y_lo, y_hi, top, xc)。
     x = 0.458*W ±8; y = 棋盘上沿往上 ~150px, 下限 y135 避开页面白色头部/
@@ -610,120 +609,34 @@ def _chip_bounds(rect, grid, H):
     return x0, x1, y_lo, y_hi, top, xc
 
 
+GOLD_ROI = (80, 180, 150, 210)      # x0, y0, x1, y1 (窗口相对像素)
+GOLD_THR = 0.094                    # 判据阈值(两帧占比几何中点)
 
 
-def _wedge_band(R, G, B, xc, Wa, Ha):
-    """徽章楔形扫描: 窗口上部(ys0..min(H,280))内定位圆环主体。
-    徽章固定在窗口上部(xc±45), 与棋盘路数无关——不用 chip_bounds
-    推导带(9 路板顶不同, 会截掉楔形)。返回 (band, ys0, b0, b1, xa)
-    或 None。"""
-    import numpy as np
-    orange = (R > 185) & ((R - G) > 45) & ((G - B) > 15)
-    ys0 = 60
-    ys1 = min(Ha, 280)
-    xa, xb = max(0, xc - 45), min(Wa, xc + 45)
-    band = orange[ys0:ys1, xa:xb]
-    if int(band.sum()) < 20:
-        return None
-    rowsum = band.sum(axis=1)
-    if int(rowsum.max()) < 4:
-        return None
-    on = rowsum >= 3
-    segs = []
-    s = None
-    for i, v in enumerate(list(on) + [False]):
-        if v and s is None:
-            s = i
-        elif not v and s is not None:
-            segs.append((s, i))
-            s = None
-    merged = []
-    for seg in segs:
-        if merged and seg[0] - merged[-1][1] <= 4:
-            merged[-1] = (merged[-1][0], seg[1])
-        else:
-            merged.append(list(seg))
-    merged = [tuple(m) for m in merged]
-    if not merged:
-        return None
-    b0, b1 = max(merged, key=lambda m: m[1] - m[0])
-    h = b1 - b0
-    if h < 18 or h > 90:
-        return None
-    return band, ys0, b0, b1, xa
+def gold_frame_ratio(rect=None, arr=None):
+    """金色倒计时空心框占比: ROI 内金黄色像素比例。
 
-
-def wedge_feature(rect, grid=None, arr=None):
-    """绿框内行棋徽章橙色楔形得分(诊断/标定用):
-    徽章区(窗口上部 xc±45, y60-280)定位圆环主体后取中段,
-    返回 (宽列数, 橙色总量, 主体y0, 主体y1) 或 None。
-    标定: 我方行棋(箭头左, 楔形入框) => 宽列>=4 且总量>=25;
-          对方行棋(箭头右) => 宽列<=2 且总量小。"""
+    金黄色特征 = R≈G 且远大于 B(R-B>90, R-G<90, G-B>40), 有别于棋盘木色
+    (木色 R>G>B 但差值平缓) 与 UI 白/灰。
+    出现该色块 = 我方行棋; 不出现 = 对方行棋。
+    返回占比(float)或 None(无法采样)。
+    """
     try:
         import numpy as np
         if arr is None:
+            if rect is None:
+                return None
             from PIL import ImageGrab
             img = ImageGrab.grab(bbox=rect).convert('RGB')
-            a = np.asarray(img).astype(np.int16)
-        else:
-            a = arr
-        H = a.shape[0]
-        W = a.shape[1]
-        x0, x1, y_lo, y_hi, _t, xc = _chip_bounds(rect, grid, H)
-        R = a[:, :, 0].astype(int)
-        G = a[:, :, 1].astype(int)
-        B = a[:, :, 2].astype(int)
-        b2 = _wedge_band(R, G, B, xc, W, H)
-        if b2 is None:
+            arr = np.asarray(img).astype(np.int16)
+        h, w = arr.shape[:2]
+        x0, y0, x1, y1 = GOLD_ROI
+        x1, y1 = min(x1, w), min(y1, h)
+        if x1 <= x0 or y1 <= y0:
             return None
-        _b, _ys0, b0, b1, _xa = b2
-        m0 = b0 + (b1 - b0) // 3
-        m1 = b0 + (b1 - b0) * 2 // 3
-        midsum = _b[m0:m1].sum(axis=0)
-        wide_cols = int((midsum >= 5).sum())
-        mx = int(midsum.sum())
-        return wide_cols, mx, _ys0 + b0, _ys0 + b1
-    except Exception:
-        return None
-
-
-def turn_arrow_geo(rect, grid=None, arr=None):
-    """窗口上部行棋徽章箭头楔形检测(官方真值, 几何模板, 无学习):
-    徽章圆环 + 箭头(同橙色), 箭头指向行棋方(左=我方(头像在左),
-    右=对方)。我方行棋(箭头左)时楔形块顶入圆环左缘(绿框条带内);
-    对方行棋(箭头右)时楔形在右缘外, 徽章区仅弧与文字笔画。
-    在窗口上部固定区(xc±45, y60-280)定位圆环主体(与棋盘路数无关),
-    取中段列投影: 宽列>=4 且橙量>=25 -> 楔形在框 -> 'white'(白方行棋);
-    宽列<=2 -> 仅弧 -> 'black'(黑方行棋); 中间 -> None。
-    返回 'white'/'black'/None(行棋方颜色, 非 mine/opp)。"""
-    try:
-        import numpy as np
-        if arr is None:
-            from PIL import ImageGrab
-            img = ImageGrab.grab(bbox=rect).convert('RGB')
-            a = np.asarray(img).astype(np.int16)
-        else:
-            a = arr
-        H = a.shape[0]
-        W = a.shape[1]
-        x0, x1, y_lo, y_hi, _t, xc = _chip_bounds(rect, grid, H)
-        R = a[:, :, 0].astype(int)
-        G = a[:, :, 1].astype(int)
-        B = a[:, :, 2].astype(int)
-        b2 = _wedge_band(R, G, B, xc, W, H)
-        if b2 is None:
-            return None
-        band, ys0, b0, b1, xa = b2
-        m0 = b0 + (b1 - b0) // 3
-        m1 = b0 + (b1 - b0) * 2 // 3
-        midsum = band[m0:m1].sum(axis=0)
-        wide_cols = int((midsum >= 5).sum())
-        mx = int(midsum.sum())
-        if wide_cols >= 4 and mx >= 25:
-            return 'white'   # 楔形 = 箭头左 = 白方行棋(真值图语义)
-        if wide_cols <= 2:
-            return 'black'   # 仅弧 = 箭头右 = 黑方行棋
-        return None
+        s = arr[y0:y1, x0:x1]
+        R, G, B = s[:, :, 0].astype(int), s[:, :, 1].astype(int), s[:, :, 2].astype(int)
+        return float(((R - B > 90) & (R - G < 90) & (G - B > 40)).mean())
     except Exception:
         return None
 
@@ -762,7 +675,6 @@ def strip_rgb_sig(rect, grid=None, arr=None):
         return ''
     frac, mean = st
     return '均(%d,%d,%d) 异%.2f' % (mean[0], mean[1], mean[2], frac)
-
 
 
 def _is_game_page():

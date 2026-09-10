@@ -266,46 +266,17 @@ def _set_st(force=False, **kw):
     ui_pub(force)
 
 
-def vis_learn(cls, frac):
-    """可信时刻(算术锁定回合)更新绿框两态参考"""
-    if frac is None:
-        return
-    r = _VIS_REF[cls]
-    _VIS_REF[cls] = frac if r is None else r * 0.7 + frac * 0.3
-
-
-
-
-def vis_classify(frac):
-    """绿框异占比 -> 'mine'(我方行棋) / 'opp'(对方行棋) / None(模糊)。
-    两态参考齐备且有序时取中点分界(自适应布局漂移); 否则就近匹配单参考
-    (±0.03); 再否则退回固定阈值 VIS_MINE_T/VIS_OPP_T。"""
-    if frac is None:
-        return None
-    m, o = _VIS_REF['mine'], _VIS_REF['opp']
-    if m is not None and o is not None and o > m:
-        mid = (m + o) / 2
-        return 'mine' if frac < mid else 'opp'
-    if m is not None and abs(frac - m) <= 0.03:
-        return 'mine'
-    if o is not None and abs(frac - o) <= 0.03:
-        return 'opp'
-    if frac <= VIS_MINE_T:
-        return 'mine'
-    if frac >= VIS_OPP_T:
-        return 'opp'
-    return None
-
-
-
-
-def visual_turn(res_cur, rect=None):
-    """视觉行棋判定: 徽章几何(官方真值: 楔形=白方行棋/仅弧=黑方行棋,
-    无需学习)优先; 异+自学习兜底(obox)。
-    返回 (src, val, 描述): 'geo' -> val='white'/'black'(行棋方颜色);
-    'obox' -> val='mine'/'opp'(相对我方); None -> 不确定。"""
+def visual_turn(res_cur, rect=None, assist=None):
+    """视觉行棋判定(唯一机制 = 金色倒计时空心框; 徽章 geo 与 obox 兜底
+    均已彻底删除)。
+    判据: ROI(80,180)-(150,210) 内出现金黄色块 = 我方行棋, 否则对方行棋。
+    需 assist(我执色)把 mine/opp 换算成颜色返回, 保持与旧 geo 相同的
+    返回语义(颜色), 调用方无需改动。
+    金框为确定性判据(只要有当前帧即可算), 不再保留任何兜底路径;
+    采样失败一律返回不确定, 由调用方重试——不猜。
+    返回 (src, val, 描述): ('gold', 行棋方颜色, 描述) 或 (None, None, '')。"""
     try:
-        if res_cur is None:
+        if res_cur is None or assist is None:
             return None, None, ''
         _im = res_cur.get('img') if res_cur else None
         _arr = None
@@ -313,63 +284,38 @@ def visual_turn(res_cur, rect=None):
             import numpy as _np
             _arr = _np.asarray(_im).astype(_np.int16)
         _rect = rect or res_cur.get('rect')
-        _grd = res_cur if (res_cur and 'ys' in res_cur) else None
-        _g = winclick.turn_arrow_geo(_rect, _grd, _arr)
-        if _g in ('white', 'black'):
-            return 'geo', _g, ('徽章:%s方行棋' %
-                               ('白' if _g == 'white' else '黑'))
-        _st = winclick.strip_box_stats(_rect, _grd, _arr)
-        if _st is not None:
-            _vc = vis_classify(_st[0])
-            return 'obox', _vc, '异%.2f' % _st[0]
-    except Exception:
-        pass
+        _gf = winclick.gold_frame_ratio(_rect, _arr)
+        if _gf is None:
+            return None, None, ''
+        mine = _gf >= winclick.GOLD_THR
+        val = assist if mine else other(assist)
+        return 'gold', val, ('金框%.3f:%s方行棋' % (_gf, '我' if mine else '他'))
+    except Exception as _e:
+        print(f'  [行棋判定异常] {type(_e).__name__}: {_e}')
     return None, None, ''
 
 
 
 
 def anchor_turn_visual(counts, assist, res_cur):
-    """启动锚定: 绿框视觉判定为唯一依据——盘中提子使子数差失真,
-    奇偶无意义, 只在绿框里找答案。优先级: ①官方徽章几何(楔形=白方
-    行棋/仅弧=黑方行棋, 语义直接, 无需学习) ②异值两态参考/固定阈值。
-    空盘是铁律: 黑先手必轮到黑(与我方执色无关), 直接锚定并顺带把绿框
-    两态参考学到(从第一局首秒起自适应布局, 消除冷启动误判)。锚定不
-    写入参考(首判可能受固定阈值误导); 参考只在算术锁定的可信时刻学习。
-    绿框不可判时重试(横幅动画/遮挡是瞬态的), 仍不可判返回
-    (None, 'unresolved')——不猜, 交人工。
+    """启动锚定: 唯一机制 = 金色倒计时空心框(徽章 geo / 子数奇偶算术 /
+    绿框 obox 兜底 均已彻底删除)。
+    判据: 有金框=我方行棋, 无金框=对方行棋(无需学习, 无滞后歧义, 实测两态
+    区分度 ~5.7 倍)。
+    空盘是铁律: 黑先手必轮到黑(与我方执色无关), 直接锚定无需视觉判定。
+    取不到当前帧时重试; 连续重试仍失败返回 (None, 'unresolved')
+    ——不猜, 交人工。
     返回 (turn, 'visual'/'empty'/'unresolved')。"""
     if counts[0] + counts[1] == 0:
-        # 空盘: 必轮到黑; 此刻轮次是算术铁律, 绿框采样即该态的真值
-        try:
-            _rw = br.window_rect(br.PID)
-            _grd = res_cur if (res_cur and 'ys' in res_cur) else None
-            _im = res_cur.get('img') if res_cur else None
-            _arr = None
-            if _im is not None:
-                import numpy as _np
-                _arr = _np.asarray(_im).astype(_np.int16)
-            _st = winclick.strip_box_stats(_rw, _grd, _arr)
-            if _st is not None:
-                _cls = 'mine' if assist == 'black' else 'opp'
-                vis_learn(_cls, _st[0])
-                print(f'  空盘学习: {"我方" if assist=="black" else "对方"}'
-                      f'回合参考=异{_st[0]:.2f} '
-                      f'(参考: 我方{_VIS_REF["mine"]} 对方{_VIS_REF["opp"]})')
-        except Exception:
-            pass
+        # 空盘: 必轮到黑(黑先手铁律), 无需视觉判定
         return 'black', 'empty'
-    # 绿框视觉判定: 三路交叉, 不盲信单一徽章(徽章在落子后数秒滞后,
-    # 会显示上一手的行棋方)。三路: 徽章几何(geo) / 绿框异占比(obox)
-    # / 算术(黑==白->黑该走; 黑>白->白该走; 白>黑->黑该走)。
-    # 算术前提子会失真, 故只作交叉参考; 至少一路视觉有效才入票,
-    # 多数决(含算术)定轮次。徽章滞后单路不再直判, 避免误锚。
+    # 唯一判据 = 金色倒计时空心框: 有=我方行棋 / 无=对方行棋。
+    # 徽章 geo / 子数奇偶算术 / 绿框 obox 均已彻底删除, 无任何兜底。
     _other = ('white' if assist == 'black' else 'black')
     try:
         _rw = br.window_rect(br.PID)
     except Exception:
         _rw = None
-    _grd = res_cur if (res_cur and 'ys' in res_cur) else None
     for _i in range(4):
         try:
             _arr = None
@@ -377,76 +323,17 @@ def anchor_turn_visual(counts, assist, res_cur):
             if _im is not None:
                 import numpy as _np
                 _arr = _np.asarray(_im).astype(_np.int16)
-            # 算术(提子失真, 仅交叉参考)
-            if counts[0] == counts[1]:
-                _arith = 'black'
-            elif counts[0] > counts[1]:
-                _arith = 'white'
-            else:
-                _arith = 'black'
-            # 视觉两路
-            _g = winclick.turn_arrow_geo(_rw, _grd, _arr)
-            _st = winclick.strip_box_stats(_rw, _grd, _arr)
-            _obox_turn = None
-            if _st is not None:
-                _vc = vis_classify(_st[0])
-                if _vc == 'mine':
-                    _obox_turn = assist
-                elif _vc == 'opp':
-                    _obox_turn = _other
-            # 提子场景: 子数差>1 则奇偶假设失效, 算术弃票(否则会误投错方)
-            _capture = abs(counts[0] - counts[1]) > 1
-            _arith_str = _arith if not _capture else '~(提子失真)'
-            _have_geo = _g in ('white', 'black')
-            _have_obox = _obox_turn in ('white', 'black')
-            # 至少一路视觉有效才入票; 否则重试(保留不可判->人工路径)
-            if not (_have_geo or _have_obox):
-                time.sleep(0.6)
+            _gf = winclick.gold_frame_ratio(_rw, _arr)
+            if _gf is None:
+                time.sleep(0.6)      # 未拿到当前帧: 重试取帧, 不猜
                 continue
-            # 决策优先级:
-            #  - 无提子: 算术奇偶为地面真值; 视觉两路一致直接采信,
-            #    视觉两路矛盾时取与算术同色者(算术/另一路误判其一)。
-            #  - 有提子: 算术失效, 仅看视觉两路; 一致采信, 矛盾取 obox
-            #    (徽章落子后/启动瞬间滞后, obox 为确认信号)。
-            if not _capture:
-                if _have_geo and _have_obox and _g == _obox_turn:
-                    if _arith == _g:
-                        _turn, _tie = _g, ''
-                    else:
-                        # 视觉两路一致却与算术(地面真值)矛盾: 落子后徽章/绿框
-                        # 滞后同指上一手, 算术(子数奇偶)实时更可靠, 采信算术
-                        _turn, _tie = _arith, ', 视觉一致但悖算术->取算术(徽章/绿框滞后)'
-                elif _have_geo and _have_obox:
-                    if _arith == _g:
-                        _turn, _tie = _g, ', geo=算术(obox异)'
-                    else:
-                        _turn, _tie = _obox_turn, ', obox=算术(geo异)'
-                elif _have_geo:
-                    if _arith == _g:
-                        _turn, _tie = _g, ''
-                    else:
-                        _turn, _tie = _arith, ', 仅徽章与算术矛盾取算术(奇偶)'
-                else:  # 仅 obox
-                    if _arith == _obox_turn:
-                        _turn, _tie = _obox_turn, ''
-                    else:
-                        _turn, _tie = _arith, ', 仅obox与算术矛盾取算术(奇偶)'
-            else:  # 提子: 算术失效, 仅视觉两路
-                if _have_geo and _have_obox:
-                    if _g == _obox_turn:
-                        _turn, _tie = _g, ''
-                    else:
-                        _turn, _tie = _obox_turn, ', 视觉矛盾取obox(徽章滞后)'
-                elif _have_geo:
-                    _turn, _tie = _g, ''
-                else:
-                    _turn, _tie = _obox_turn, ''
-            print(f'  锚定交叉: 徽章={_g} obox={_obox_turn} '
-                  f'算术={_arith_str}(黑{counts[0]}白{counts[1]})'
-                  f' -> 轮到{"黑" if _turn == "black" else "白"}{_tie}')
+            _turn = assist if _gf >= winclick.GOLD_THR else _other
+            print(f'  锚定: 金框={_gf:.3f} (黑{counts[0]}白{counts[1]})'
+                  f' -> 轮到{"黑" if _turn == "black" else "白"}')
             return _turn, 'visual'
-        except Exception:
-            pass
+        except Exception as _e:
+            # 不再静默吞异常(此前 NameError 被吞导致连判失败却无提示)
+            print(f'  [锚定异常] {type(_e).__name__}: {_e}')
         time.sleep(0.6)
     print('?? 视觉状态连续无法判定(读数失败或异值死区), 不猜奇偶;')
     print('   请确认微信窗口在前台且处于对局页, 在 UI 里选[当前轮到]后'
@@ -845,10 +732,8 @@ def trend_record(board_n, board_cur, move_no, to_move=None):
             print(f'!! 趋势记录失败: {sys.exc_info()[1]}, 图表将不更新')
 
 
-# ---- 视觉行棋(异+自学习)全局 ----
-VIS_MINE_T = 0.12
-VIS_OPP_T = 0.14
-VIS_OVERRIDE_S = 15.0   # 视觉与算术矛盾超过该时长则无视视觉放行(防卡死)
+# ---- 视觉行棋(金框唯一判据)全局 ----
+VIS_OVERRIDE_S = 15.0   # 视觉显示对方回合超过该时长则放行(防卡死)
 # 回合锁定: 任何"确定的回合翻转"(board-change/落子/弹窗)之后进入锁窗,
 # 锁窗内屏蔽"等待期视觉校正"翻回合。根因=对方落子后绿框横幅滞后数秒仍显示
 # 我方行棋, 旧逻辑(门槛12s)在滞后期内连续两次视觉=我方会把回合误翻回我方。
@@ -856,7 +741,6 @@ VIS_OVERRIDE_S = 15.0   # 视觉与算术矛盾超过该时长则无视视觉放
 # 仍能救回, 仅延迟约 锁窗+连续两次采样)。
 TURN_LOCK_SECS = 15.0
 TURN_LOCK = {'until': 0.0}
-_VIS_REF = {'mine': None, 'opp': None}
 
 # ---- 点击/悬停状态 ----
 _rend = None
@@ -899,12 +783,8 @@ _plast = {}  # 降噪: 消息节流
 
 
 # 视觉行棋判定: 特征 = 绿框整块"异占比"(偏离框背景色的像素比例)。
-# 整框指标对 y 漂移免疫(内容整体上下移不影响整框统计, 且绿框跟随棋盘
-# 上沿); 两态零重叠(实测: 布局A 我方0.10/对方0.16; 布局B 0.15/0.20,
-# 方向一致=异高是对方回合)。绝对值跨布局漂移由运行时自学习参考收敛
-# (_VIS_REF 存异两态参考, 取中点分界)
-
-# 绿框两态参考(运行时自学习, EMA): 存"异"的我方/对方参考值
+# 注: 旧的"绿框整框异占比(obox)"判据及其自学习参考(_VIS_REF)已彻底删除,
+# 行棋判定统一由"金色倒计时空心框"(winclick.gold_frame_ratio)独家负责。
 
 
 def plog(key, interval, msg):
@@ -1779,13 +1659,10 @@ def main():
                             _arr2 = None
                     _sig2 = winclick.strip_rgb_sig(_rw2, _grd2, _arr2)
                     if _sig2:
-                        _w2 = winclick.wedge_feature(_rw2, _grd2, _arr2)
-                        _ws = (' W(%d,%d@%d-%d)' % _w2) if _w2 else ''
-                        _g2 = winclick.turn_arrow_geo(_rw2, _grd2, _arr2)
-                        if _g2:
-                            _ws += (' 徽章:'
-                                    + ('白方' if _g2 == 'white' else '黑方')
-                                    + '行棋')
+                        _gf2 = winclick.gold_frame_ratio(_rw2, _arr2)
+                        _ws = ('' if _gf2 is None
+                               else ' 金框%.3f(%s)' % (_gf2, '我方' if _gf2 >= winclick.GOLD_THR
+                                                      else '对方'))
                         _log2 = _sig2 + _ws
                         if _log2 != _sig_last:
                             _sig_last = _log2
@@ -1805,43 +1682,19 @@ def main():
                 if time.time() - _vis_my_at > 3.0:
                     _vis_my_at = time.time()
                     try:
-                        _srcw, _resw, _infow = visual_turn(res_cur)
-                        if _srcw == 'geo':
-                            _wcls = ('mine' if _resw == assist
-                                     else 'opp')  # geo: 白/黑行棋 -> mine/opp
-                            _wf = None
-                            # 高风险翻回合双保险: geo 单独说"我方行棋"很可能是
-                            # 徽章横幅滞后(我方刚落子后箭头仍指向我方)。要求
-                            # 独立信号 obox(异占比两态, 异高=对方回合)也判"我方"
-                            # 才采信; 两路矛盾视为滞后/误判, 不翻回合, 避免误点错手。
-                            if _wcls == 'mine':
-                                try:
-                                    _stb = winclick.strip_box_stats(
-                                        _rw2, _grd2, _arr2)
-                                    if _stb is not None:
-                                        _obc = vis_classify(_stb[0])
-                                        if _obc != 'mine':
-                                            _wcls = None
-                                except Exception:
-                                    pass
-                        elif _srcw == 'obox':
-                            _wcls = _resw
-                            _wf = float(_infow.split('异')[1])
-                            if _wcls != 'mine' and _wf is not None:
-                                vis_learn('opp', _wf)
-                        else:
-                            _wcls = None
-                            _wf = None
+                        _srcw, _resw, _infow = visual_turn(res_cur, assist=assist)
+                        # gold: 行棋方颜色 -> mine/opp; 其余一律不可判
+                        _wcls = ('mine' if _resw == assist else 'opp') \
+                            if _srcw == 'gold' else None
+                        _wf = None
                     except Exception:
                         _wcls = None
                         _wf = None
                     if _wcls == 'mine':
                         _vis_my_n += 1
                         if _vis_my_n >= 2:   # 连续两次(约6s)视觉=我方
-                            print(f'[视觉行棋] 等待期视觉=我方'
-                                  f'(异{_wf:.2f}) ' if _wf is not None else
-                                  '[视觉行棋] 等待期视觉=我方'
-                                  f' 而盘面未变, 翻回我方回合')
+                            print('[视觉行棋] 等待期视觉=我方(金框) '
+                                  '而盘面未变, 翻回我方回合')
                             turn = assist
                             acted_counts = (-1, -1)
                             _vis_my_n = 0
@@ -1860,6 +1713,30 @@ def main():
                         turn = assist
                         acted_counts = (-1, -1)
                         TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
+                    elif ev == 'resign_ok':
+                        # 对方投子认输已点[确定]: 本局立即结束。此前只点了确认
+                        # 却未收尾, 主循环继续按正常对局读盘 -> 空盘/轮次反复
+                        # 横跳(无新增子丢弃)直到 30s 才由 err_streak 兜底。
+                        # 这里直接走终局流程: 结算页 -> 点[重新匹配/续战]进下一盘
+                        print('[认输] 本局结束, 进入结算/下一局流程')
+                        _GAME_ACTIVE[0] = False
+                        g2 = end_or_wait('对局结束(对方认输)')
+                        if g2 is None:
+                            return
+                        n, board, counts, res_cur = g2
+                        last_counts = counts
+                        last_n = n
+                        acted_counts = (-1, -1)
+                        turn = 'black'
+                        cand = None
+                        last_activity = time.time()
+                        failed_cycles = 0
+                        err_streak = 0
+                        consec_bad = 0
+                        vanish_sum = 0
+                        bad_points.clear()
+                        _vis_opp_since = 0.0
+                        continue
                 except Exception:
                     pass
 
@@ -2082,26 +1959,17 @@ def main():
                         continue
                     if g is not None:
                         n, board, counts, res_cur = g
-                # 视觉行棋确认: 官方箭头几何优先(geo=白/黑行棋),
-                # 异+自学习兜底(obox=mine/opp)。视觉明确=对方回合且
-                # 盘面稳定时暂不落子(防锚定错/翻转中); 超时按算术放行
+                # 视觉行棋确认: 唯一判据=金框(gold=白/黑行棋)。
+                # 视觉明确=对方回合且盘面稳定时暂不落子(防锚定错/翻转中);
+                # 超时则按当前盘面放行。
                 _now_v = time.time()
                 if _now_v - _vis_gate_t > 1.0:
                     _vis_gate_t = _now_v
                     try:
-                        _srcv, _resv, _infov = visual_turn(res_cur)
-                        if _srcv == 'geo':
-                            _vcls = ('mine' if _resv == assist
-                                     else 'opp')  # geo: 白/黑行棋 -> mine/opp
-                            _vf = None
-                        elif _srcv == 'obox':
-                            _vcls = _resv
-                            _vf = float(_infov.split('异')[1])
-                            if (_vcls == 'mine' and _vf is not None
-                                    and time.time() - last_change > 1.5):
-                                vis_learn('mine', _vf)
-                        else:
-                            _vcls = None
+                        _srcv, _resv, _infov = visual_turn(res_cur, assist=assist)
+                        # gold: 行棋方颜色 -> mine/opp; 其余不可判
+                        _vcls = ('mine' if _resv == assist else 'opp') \
+                            if _srcv == 'gold' else None
                     except Exception:
                         _vcls = None
                     if _vcls == 'opp':
@@ -2436,18 +2304,13 @@ def main():
                             break
                         # 级联自愈: 点击失败且盘面未变——常见于我方上一手
                         # 已落但被漏读/回合失步(实际轮到对方, 点空点被服务
-                        # 端忽略)。绿框视觉若明确=对方行棋, 翻回合停止点击。
+                        # 端忽略)。金框视觉若明确=对方行棋, 翻回合停止点击。
                         try:
-                            _vtx = visual_turn(res_cur)
-                            if _vtx[0] == 'geo':
-                                _vcy = ('opp' if _vtx[1] == _other(assist)
-                                        else 'mine')
-                            elif _vtx[0] == 'obox':
-                                _vcy = _vtx[1]
-                            else:
-                                _vcy = None
+                            _vtx = visual_turn(res_cur, assist=assist)
+                            _vcy = ('opp' if _vtx[1] == _other(assist)
+                                    else 'mine') if _vtx[0] == 'gold' else None
                             if _vcy == 'opp':
-                                print(f'[视觉闸] 点击失败+绿框'
+                                print(f'[视觉闸] 点击失败+金框'
                                       f'({_vtx[2]}) -> 实际轮到对方, '
                                       f'翻回合停止点击')
                                 turn = _other(assist)
