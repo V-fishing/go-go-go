@@ -64,6 +64,8 @@ python katago_play.py auto --mode friend --visits 8000 --wait-new
 
 UI 顶部一排操作按钮（启动 / 连续观战 / 单次分析 / 停止），左侧日志、右侧实时识别棋盘镜像。
 
+![katago_ui 控制面板](images/ui_panel.png)
+
 - **模式选择**：下拉框中文显示（好友/匹配/挑战/人机…），选择即实时调用 `br.set_game_mode()` 切换网格偏移。
 - **执色**：默认「自动识别」，UI 启动后主程序用头像角标判定；手动指定执色可跳过识别。
 - **启动**：点「启动自动落子」→ UI 拉起 `katago_play.py auto ...` 子进程，日志实时回流到左侧。
