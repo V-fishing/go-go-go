@@ -178,8 +178,30 @@ def find_render_hwnd():
     return best
 
 
+def _fallback_click(x, y):
+    """降级点击: 渲染子窗口(PID/_rend)不可用时, 用系统级真实鼠标事件按屏幕
+    坐标点击。会临时移动光标, 故点击后恢复原位以降低干扰。返回是否执行。"""
+    user32 = ctypes.windll.user32
+    pt = ctypes.wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    ox, oy = pt.x, pt.y
+    try:
+        user32.SetCursorPos(int(x), int(y))
+        user32.mouse_event(0x0002, 0, 0, 0, 0)   # MOUSEEVENTF_LEFTDOWN
+        time.sleep(0.08)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)   # MOUSEEVENTF_LEFTUP
+        return True
+    except Exception as _e:
+        print(f'  [降级点击异常] {type(_e).__name__}: {_e}')
+        return False
+    finally:
+        user32.SetCursorPos(ox, oy)
+
+
 def post_click(x, y):
-    """屏幕坐标无光标点击(PostMessage); 失败返回 False"""
+    """屏幕坐标点击: 优先 PostMessage 到渲染子窗口(无光标移动); 若渲染窗口
+    不可用(_rend=None 或越界, 如结算页/窗口重建致枚举失败), 降级为系统级真实
+    鼠标事件按屏幕坐标点击, 二者皆失败返回 False。"""
     global _rend
     user32 = ctypes.windll.user32
     if _rend is None:
@@ -200,7 +222,9 @@ def post_click(x, y):
         # 渲染窗口可能已重建(重开游戏): 重找一次再试
         _rend = None
         find_render_hwnd()
-    return False   # 点不到就不点(避免误点其他窗口)
+    # 渲染窗口不可用 -> 降级: 屏幕坐标真实鼠标点击(覆盖结算页/窗口重建场景)
+    print(f'  [post_click] 渲染窗口不可用, 降级屏幕坐标点击({x},{y})')
+    return _fallback_click(x, y)
 
 
 def ocr_buttons(keywords=None):

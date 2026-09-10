@@ -954,6 +954,9 @@ def scan_popups():
             return 'count_ok'
     if '停一手' in J or '虚着' in J or '过一手' in J:
         return 'pass'
+    if '重连' in J and '对局已结束' in J:
+        if click('确定', 'reconnect_end', '重连成功-对局已结束'):
+            return 'reconnect_end'
     return None
 
 
@@ -1500,12 +1503,25 @@ def main():
                         db = counts[0] - last_counts[0]
                         dw = counts[1] - last_counts[1]
                         if db < 1 and dw < 1:
-                            # 无新增子(撤销/悔棋/消息框闪烁/鼠标悬停误读):
-                            # 忽略。悬停与闪烁消息框都是"单次消失1-3颗"的小
-                            # 噪声(容忍); 仅当"大片消失"(vanish_max>=8, 即
-                            # 数子遮挡/换局)才判疑似结算。注意: 对方长考期
-                            # 的纯小噪声(单次消失1-3子)绝不判结算, 否则会误
-                            # 把正常长考当结算而中断对局
+                            # 无新增子: 可能是悬停/消息框噪声, 也可能是劫争提子
+                            # 中间态(对方提我方1子但落子方那1子尚未读出 => 差分呈
+                            # 单色±1、另一色0)。劫争提子单次恰少1子, 直接刷新盘面
+                            # 基准等稳定态(黑+1,白-1)出现再正常接受, 不按噪声丢弃
+                            # 累加 consec_bad(否则劫争期盘面停滞且旧版会误触结算)
+                            if db + dw == -1:
+                                last_counts = counts
+                                last_change = time.time()
+                                consec_bad = 0
+                                vanish_sum = 0
+                                vanish_max = 0
+                                print(f'(单子提中间态, 刷新基准: 黑{counts[0]}'
+                                      f'白{counts[1]})')
+                                cand = None
+                                continue
+                            # 其余无新增子(撤销/悔棋/消息框闪烁/悬停误读): 忽略。
+                            # 悬停与闪烁消息框都是"单次消失1-3颗"的小噪声(容忍);
+                            # 仅当"大片消失"(vanish_max>=8, 即数子遮挡/换局)才判
+                            # 疑似结算。注意: 对方长考期的纯小噪声绝不判结算
                             _van = -(db + dw)
                             vanish_sum += _van
                             if _van > vanish_max:
@@ -1683,14 +1699,16 @@ def main():
                         turn = assist
                         acted_counts = (-1, -1)
                         TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
-                    elif ev == 'resign_ok':
-                        # 对方投子认输已点[确定]: 本局立即结束。此前只点了确认
+                    elif ev in ('resign_ok', 'reconnect_end'):
+                        _reason = '重连成功-对局已结束' if ev == 'reconnect_end' \
+                            else '对方认输'
+                        print(f'[{_reason}] 本局结束, 进入结算/下一局流程')
+                        # 对局结束(认输/重连断开): 本局立即结束, 此前只点了确认
                         # 却未收尾, 主循环继续按正常对局读盘 -> 空盘/轮次反复
                         # 横跳(无新增子丢弃)直到 30s 才由 err_streak 兜底。
                         # 这里直接走终局流程: 结算页 -> 点[重新匹配/续战]进下一盘
-                        print('[认输] 本局结束, 进入结算/下一局流程')
                         _GAME_ACTIVE[0] = False
-                        g2 = end_or_wait('对局结束(对方认输)')
+                        g2 = end_or_wait('对局结束(' + _reason + ')')
                         if g2 is None:
                             return
                         n, board, counts, res_cur = g2
@@ -1720,18 +1738,36 @@ def main():
                     opening_garb_at = 0.0
                     # 结算->新局过渡: 等新画面渲染稳定再读角标, 避免读到旧局帧
                     time.sleep(0.8)
-                    # 分先换色: 新局以官方头像角标颜色核对执色
+                    # 分先换色: 新局用「金框(谁行棋)+空盘黑先」定执色, 比角标
+                    # 更稳(开盘即渲染, 不受角标过渡帧误读影响); 角标仅作兜底。
                     try:
-                        av = winclick.avatar_my_color()
+                        _rgf0 = br.window_rect(br.PID)
+                        _gf0 = winclick.gold_frame_ratio(_rgf0, None)
                     except Exception:
-                        av = None
-                    if av is not None and av != assist:
-                        print(f'[头像角标] 新局我方实际执'
-                              f'{("黑" if av=="black" else "白")}'
-                              f'(分先轮换), 已切换')
-                        assist = av
-                        MY_SIDE = assist
-                        side = '黑' if assist == 'black' else '白'
+                        _gf0 = None
+                    if _gf0 is not None:
+                        # 空盘黑先: 金框=我方行棋 唯一解释为我方执黑
+                        _col0 = 'black' if _gf0 >= winclick.GOLD_THR else 'white'
+                        if _col0 != assist:
+                            print(f'[开局执色] 金框判定我方执'
+                                  f'{("黑" if _col0=="black" else "白")}'
+                                  f'(空盘黑先), 已切换')
+                            assist = _col0
+                            MY_SIDE = assist
+                            side = '黑' if assist == 'black' else '白'
+                    else:
+                        # 金框不可用(渲染未就绪)时退回角标
+                        try:
+                            av = winclick.avatar_my_color()
+                        except Exception:
+                            av = None
+                        if av is not None and av != assist:
+                            print(f'[头像角标] 新局我方实际执'
+                                  f'{("黑" if av=="black" else "白")}'
+                                  f'(分先轮换), 已切换')
+                            assist = av
+                            MY_SIDE = assist
+                            side = '黑' if assist == 'black' else '白'
                     print(f'新局(空盘): 我方执'
                           f'{("黑" if assist=="black" else "白")}, '
                           f'等{("我方" if assist=="black" else "黑方")}开局')
@@ -1749,16 +1785,36 @@ def main():
                             except Exception:
                                 avb = None
                             if avb == 'white':
-                                print('[头像角标] 新局我方实际执白, 已切换'
-                                      '(等待黑方开局)')
-                                assist = 'white'
-                                MY_SIDE = assist
-                                side = '黑' if assist == 'black' else '白'
-                                acted_counts = (-1, -1)
-                                opening_probed = False
-                                opening_since = None
-                                opening_blk_n = 0
-                                continue
+                                # 金框守卫: 若金框=我方行棋(空盘黑先), 说明是
+                                # 角标过渡误读白, 忽略之, 保持我方执黑开局
+                                try:
+                                    _rgf2 = br.window_rect(br.PID)
+                                    _gf2 = winclick.gold_frame_ratio(_rgf2, None)
+                                except Exception:
+                                    _gf2 = None
+                                if _gf2 is not None and _gf2 >= winclick.GOLD_THR:
+                                    opening_blk_n += 1
+                                    if opening_blk_n >= 2:
+                                        print('[金框守卫] 角标误读白, 金框确认'
+                                              '我方执黑, 开局')
+                                        opening_probed = True
+                                        opening_since = None
+                                        acted_counts = (-1, -1)
+                                        # 不 continue: 落到行动门直接落子
+                                    else:
+                                        print('[金框守卫] 角标读白但金框=我方'
+                                              '行棋, 保持执黑')
+                                else:
+                                    print('[头像角标] 新局我方实际执白, 已切换'
+                                          '(等待黑方开局)')
+                                    assist = 'white'
+                                    MY_SIDE = assist
+                                    side = '黑' if assist == 'black' else '白'
+                                    acted_counts = (-1, -1)
+                                    opening_probed = False
+                                    opening_since = None
+                                    opening_blk_n = 0
+                                    continue
                             if avb == 'black':
                                 opening_blk_n += 1
                                 if opening_blk_n >= 2:
@@ -2330,9 +2386,19 @@ def main():
                                     pass
                             except Exception:
                                 pass
-                        print(f'? 第{attempt+1}次未确认我方落子'
-                              f'(目标无我方子), 稍后重试')
-                        time.sleep(1.5)
+                        # 落子被拒兜底: 我方回合、盘面无变化、金框非对方 ->
+                        # 极可能是劫禁(本回合不可提回)或客户端禁入点。立即把
+                        # 该点加入黑名单并失效预热缓存, 强制重新分析(banned)
+                        # 改选他处, 杜绝反复点同一被禁点造成的死循环/异常。
+                        # 注: detect_ko 因 board_reader 内一处死条件(XO in
+                        # ('.X','X.') 单字符永不等于双字符)永远返回 None, 劫禁
+                        # 预检从未生效; 故用落子被拒兜底作为主防线更稳妥。
+                        bad_points.add(mv)
+                        PRE['done'] = False
+                        PRE['mv'] = None
+                        print(f'!! 落子未确认, 把 {mv} 加入黑名单并重算'
+                              f'(疑似劫禁/禁入点)')
+                        time.sleep(0.5)
                         continue
                     # 成功: 吸收己方落子造成的盘面变化
                     delta = (counts3[0] + counts3[1]) - total
