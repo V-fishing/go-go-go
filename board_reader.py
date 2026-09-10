@@ -35,6 +35,34 @@ STAR_POINTS = {
     9: [(4, 4)],
 }
 
+# ---- 对局模式 -> 网格整格偏移 -----------------------------------------
+# 不同对局模式(匹配/AI对战/友谊赛/挑战赛)的棋盘在屏幕上的位置/缩放存在细微
+# 偏差, 自动拟合会系统性偏一格。按模式套用一组固定整格偏移(相对自动拟合结果),
+# 各模式棋盘几何一致, 默认无偏移即对齐。若后续发现某模式系统性偏移, 再按
+# 模式单独标定(目前 match/ai/friend/challenge 实测均无需偏移)。
+GAME_MODE = 'challenge'   # 默认挑战赛
+MODE_GRID_OFFSET = {
+    # mode: (dcol, drow)  整格偏移(列方向, 行方向), 正=右/下
+    'match':     (0, 0),   # 匹配: 实测无偏移即对齐(顶行读真实棋子, 偏移反把网格推出棋盘)
+    'ai':        (0, 0),   # AI对战(待标定)
+    'friend':    (0, 0),   # 友谊赛(待标定)
+    'challenge': (0, 0),   # 挑战赛: 实测无偏移即对齐(同匹配, 偏移(-1,-1)会把网格推到顶部UI致顶行全白)
+}
+
+
+def set_game_mode(mode):
+    """设置对局模式, 影响 find_board_in_window 的网格偏移校准。"""
+    global GAME_MODE
+    if mode in MODE_GRID_OFFSET:
+        GAME_MODE = mode
+    else:
+        print('!! 未知对局模式 %r, 沿用 %r' % (mode, GAME_MODE))
+
+
+def _mode_grid_offset():
+    """返回当前模式的整格偏移 (dcol, drow)。"""
+    return MODE_GRID_OFFSET.get(GAME_MODE, (0, 0))
+
 
 def _proc_name(pid):
     """进程可执行文件名(小写)"""
@@ -359,14 +387,30 @@ def find_board_in_window(a, size_only=0):
         exact = (len(rows) == k or len(cols) == k)
         star = star_ratio(a, xs, ys)
         star_score = star if star is not None else 0.5
+        # 越界惩罚封顶: 真实棋盘边缘线被 UI/信息栏遮挡时, 大尺寸 fit 会
+        # 外推到遮挡区, 不应因此重罚而误选小尺寸(诊断#_diag_size: 19路
+        # oh=76.7 被压到 17.65, 13路 oh=0 反以 30.80 胜出, 致19路误判13路)
+        oh = min(oh, 40.0)
         score = (cov + 6.0 * star_score + (8.0 if exact else 0.0)
-                 - 0.4 * oh)
+                 - 0.15 * oh)
         cands.append((score, k, (np.array(xs), np.array(ys)), sy, star))
     if not cands:
         return None
     cands.sort(key=lambda c: -c[0])
     score, k, (xs, ys), step, star = cands[0]
     xs, ys = _inset_to_lines(a, xs, ys)
+    # 按对局模式套用整格偏移: 不同模式棋盘位置/缩放存在细微偏差, 自动拟合
+    # 会系统性偏一格。偏移由 GAME_MODE 决定(挑战赛实测左移1格+上移1格)。
+    # 约定: dcol/drow 为"期望的整格位移", 负值=左移/上移, 故用 +dcol*sx。
+    _dcol, _drow = _mode_grid_offset()
+    if _dcol or _drow:
+        _sx = float(xs[1] - xs[0])
+        _sy = float(ys[1] - ys[0])
+        _xs2, _ys2 = xs + _dcol * _sx, ys + _drow * _sy
+        if _xs2[0] > 0 and _xs2[-1] < a.shape[1] - 1:
+            xs = _xs2
+        if _ys2[0] > 0 and _ys2[-1] < a.shape[0] - 1:
+            ys = _ys2
     return xs, ys, {'size': k, 'step': step, 'src': 'auto',
                     'confidence': round(score, 1), 'star': star}
 
@@ -1046,6 +1090,15 @@ def read_board(a, xs, ys, stone_r):
     hw = int(min(W - 1, max(6, step * 0.52)))
     iy = np.round(np.asarray(ys, float)).astype(int)
     ix = np.round(np.asarray(xs, float)).astype(int)
+    h, w = a.shape[:2]
+    # 边界钳制 + 有效性掩码: 网格端点因 UI 遮挡/漂移超出图像时, 钳制防
+    # 采样越界崩溃(IndexError); 越界点不判子(被遮挡列不可读, 不能用边框
+    # /面板像素误判棋子)。_diag_size 诊断: 19路最右列 xs[-1]=519.4 超出
+    # 窗口宽 519, 原采样直接崩; 右侧 2 列被 UI 面板遮挡。
+    iyc = iy.clip(0, h - 1)
+    ixc = ix.clip(0, w - 1)
+    _row_ok = (iy >= 0) & (iy < h)
+    _col_ok = (ix >= 0) & (ix < w)
     lum2 = a.mean(axis=2)
     chm2 = a.max(axis=2) - a.min(axis=2)
     blk = (lum2 < 105) & (chm2 < 30)
@@ -1064,10 +1117,10 @@ def read_board(a, xs, ys, stone_r):
     runbv = np.zeros((n, n), int)   # 上段最长黑连续
     runwv = np.zeros((n, n), int)   # 上段最长白连续
     for i in range(n):
-        yy = iy[i]
+        yy = iyc[i]
         yl = max(0, yy - hw)
         for j in range(n):
-            xx = ix[j]
+            xx = ixc[j]
             xl = max(0, xx - hw)
             runbw[i, j] = _best_run(blk[yy, xl:xx + 1])
             runww[i, j] = _best_run(wht[yy, xl:xx + 1])
@@ -1076,8 +1129,8 @@ def read_board(a, xs, ys, stone_r):
     # 半段直读可独立成立(与芯判定 OR): 网格交点与子心错位/漂移时,
     # 采样芯可能偏出子体, 但左/上 半段最长同色连续 >=8px 仍是真子证据;
     # 悬停方块(6px)/星位点(2-3px)在半段上依然 <8 被排除
-    cen_b = blk[iy, ix]
-    cen_w = wht[iy, ix]
+    cen_b = blk[iyc, ixc]
+    cen_w = wht[iyc, ixc]
     halfb = (runbw >= 8) | (runbv >= 8)
     halfw = (runww >= 8) | (runwv >= 8)
     # 芯判子须 AND 相应色半段>=8(方块: 芯判黑但半段仅6px -> 排除);
@@ -1119,11 +1172,14 @@ def read_board(a, xs, ys, stone_r):
             if not (X[_i, _j] or O[_i, _j]):
                 continue
             _flat[_i, _j] = _ui_flat_block(
-                a, ix[_j], iy[_i], 'X' if X[_i, _j] else 'O', step)
+                a, ixc[_j], iyc[_i], 'X' if X[_i, _j] else 'O', step)
     if _flat.any():
         X = X & ~_flat
         O = O & ~_flat
     # 内芯(离轴)19路仅 4 采样点, nv 下限 3 即足够占比统计
+    _bad = ~(np.outer(_row_ok, _col_ok))   # 越界交点(被遮挡)不判子
+    X = X & ~_bad
+    O = O & ~_bad
     grid = np.where(nv < 3, '?', np.where(X, 'X', np.where(O, 'O', '.')))
     board = [''.join(r) for r in grid.tolist()]
     _flash_check(a, xs, ys, stone_r, board)
@@ -1137,7 +1193,7 @@ def read_board(a, xs, ys, stone_r):
             _rowdiag_t[0] = _t.time()
             _parts = []
             for _i in range(n):
-                _rl = lum2[iy[_i], ix]
+                _rl = lum2[iyc[_i], ixc]
                 _med = int(np.median(_rl))
                 _no = sum(1 for _j in range(n) if board[_i][_j] == 'O')
                 _nx = sum(1 for _j in range(n) if board[_i][_j] == 'X')
@@ -1219,8 +1275,7 @@ def align_reset():
 # 悬停而出现; 真落子下一帧自然保留(仅延迟 1 个读盘周期)。
 # PostMessage 注入的合成悬停只发生在点击目标, 点击后该点立即变为真子,
 # 不产生持续幻影, 无需处理。
-_cursor_last_raw = {}   # key -> 上一帧原始 board(未经守卫修改)
-_cursor_hover = {}      # key -> ((i,j), base)
+_cursor_nobuf = {}     # key -> {(i,j): char} 最近一次"光标不在该点"时的真实读数
 
 
 def _cursor_pos():
@@ -1232,46 +1287,52 @@ def _cursor_pos():
 
 
 def _cursor_guard(board, xs, ys, cursor_pt, step, key):
-    """光标悬停守卫: 冻结"光标所在交点"为进入该点前的读数。
+    """光标悬停守卫: 冻结"光标所在交点"为它**最近一次无光标时**的读数。
 
-    行棋预览方块跟随真实光标、只出现在空交叉点、颜色=行棋方; 黑框带
-    渐变与坐标文字(实测方差 25~209), 平坦度判据拦不住, 故改为按位置
-    排除:
-      进入 P 前 P 为空 -> 冻结 '.'(框被忽略, 光标停留期间持续有效);
-      进入 P 前 P 有子 -> 冻结该子(有子的点不画预览框, 本无干扰)。
-    base 只在"光标切换到新交点"的那一帧采样, 且取**上一帧原始读数**
-    (那一刻光标还在别处、该点无框)。若存被守卫修改过的值, 框的值会
-    成为下一帧的 base, 守卫失效(实测只挡住一帧); 若存本帧原始值,
-    同样会把框当基准。
-    代价: 光标停留期间该点不再更新; 对手若恰好落子于此, 需待光标移开
-    后下一帧才识别(概率 1/361, 移开即恢复)。
+    行棋预览方块/落子提示跟随真实光标、只出现在空交叉点、颜色=行棋方;
+    黑框带渐变与坐标文字(实测方差 25~209), 平坦度判据拦不住, 故按位置
+    排除。
+
+    【修复】base 不再取"上一帧原始读数"。旧逻辑在光标进入交点的过渡帧
+    里, 上一帧光标已在交点内、该点已画预览方块 -> base 被方块色污染 ->
+    之后基准锁成错误值, 预览方块持续被当成棋子(星位因小黑点叠加更易
+    触发, 即"鼠标经过星位实心方块被识别为子")。
+
+    改为维护"无光标读数缓冲": 每帧对**光标影响圈外**的交点写入其真实 raw
+    读数; 光标在 P 及附近(半径 excl=1.2*step, 覆盖预览方块±0.4step + 棋子
+    半径 0.32step)时不写入, 保留进入 P 前最后的干净读数 -> base 恒来自"光标
+    不在 P"的帧, 且方块侵入 P 邻点的过渡帧也不会污染 P 的 base。任意空交叉
+    点的预览方块都稳定被冻结回真实空('.')/真子。
+    代价: 光标停留期间 P 不更新, 对手恰落子于 P(概率 1/361)需待光标移开
+    后下一帧才识别, 与旧逻辑一致(移开即恢复)。
     """
+    n = len(xs)
+    buf = _cursor_nobuf.setdefault(key, {})
     idx = None
+    excl = step * 1.2   # 光标影响圈: 预览方块±0.4step + 棋子半径0.32step 留余量
     if cursor_pt is not None:
         j = int(np.argmin(np.abs(np.asarray(xs, float) - cursor_pt[0])))
         i = int(np.argmin(np.abs(np.asarray(ys, float) - cursor_pt[1])))
         if (abs(xs[j] - cursor_pt[0]) <= step * 0.55
                 and abs(ys[i] - cursor_pt[1]) <= step * 0.55):
             idx = (i, j)
-    prev_raw = _cursor_last_raw.get(key)
-    st = _cursor_hover.get(key)
+    # 写缓冲: 仅光标影响圈外(圈内保留进入前真实读数, 防方块侵入过渡污染)
+    for ii in range(n):
+        for jj in range(n):
+            if cursor_pt is None:
+                buf[(ii, jj)] = board[ii][jj]
+            else:
+                d = ((xs[jj] - cursor_pt[0]) ** 2
+                     + (ys[ii] - cursor_pt[1]) ** 2) ** 0.5
+                if d >= excl:
+                    buf[(ii, jj)] = board[ii][jj]
     out = board
     if idx is not None:
         i, j = idx
-        if st is None or st[0] != idx:
-            base = '.'
-            if prev_raw and i < len(prev_raw) and j < len(prev_raw[i]):
-                c = prev_raw[i][j]
-                base = c if c in 'XO.' else '.'
-        else:
-            base = st[1]
-        if board[i][j] != base:
+        base = buf.get((i, j), '.')
+        if board[i][j] != base and base in 'XO.':
             out = list(board)
             out[i] = board[i][:j] + base + board[i][j + 1:]
-        _cursor_hover[key] = (idx, base)
-    else:
-        _cursor_hover.pop(key, None)
-    _cursor_last_raw[key] = board
     return out
 
 
@@ -1471,7 +1532,26 @@ def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
     global _top_bad
     _top = board[0]
     _top_n = sum(1 for c in _top if c in 'XO')
-    if _top_n >= 6:
+    _top_same = max(_top.count('X'), _top.count('O'))
+    # 改进判据: 仅"顶行单色占比极高(规则 UI 点阵特征) 且 网格首行被推到窗口
+    # 顶部 UI 带"才判异常; 边线正常布局(混色散落 / 首行不在 UI 带)放行,
+    # 避免实战边线落 6+ 子被误丢成 None。
+    if _top_n >= 6 and _top_same >= _top_n * 0.85 and ys[0] < 150:
+        # 顶行大量同色子: 多为"模式偏移套错"把网格顶行推到页面顶部白色
+        # UI(头像/计时/段位)所致。临时用无偏移模式重跑整条读盘流程兜底
+        # (复用对齐/退化检测, 与手动选对应模式等价); 仍异常才计为坏帧丢弃。
+        if _mode_grid_offset() != (0, 0):
+            _old = GAME_MODE
+            try:
+                set_game_mode('ai')   # ai 偏移 (0,0) = 无偏移基准
+                _retry = read_img(a, rect, vis_h, use_calib=use_calib,
+                                  force_auto=force_auto, do_align=do_align,
+                                  force_size=force_size, cursor_pt=cursor_pt)
+            finally:
+                set_game_mode(_old)
+            if _retry is not None:
+                _top_bad = 0
+                return _retry
         _top_bad += 1
         if _top_bad >= 2:
             clear_grid_cache()
@@ -1485,9 +1565,15 @@ def read_img(a, rect, vis_h, use_calib=False, force_auto=False,
                        and abs(e[1][0] - ys[0]) < 2)]
     entries.append(entry)
     _grid_cache[key] = entries[-2:]
+    # 截断标记: 网格端点超出图像边界 = 棋盘被窗口边缘/UI 面板遮挡,
+    # 该侧若干列/行不可读(见 _diag_size 诊断: 19路最右列 xs[-1]=519.4
+    # 超出窗口宽 519, 右侧 2 列被遮挡)。主循环可据此提示用户调整窗口。
+    _h, _w = a.shape[:2]
+    truncated = (xs[0] < -0.5 or xs[-1] > _w - 0.5
+                 or ys[0] < -0.5 or ys[-1] > _h - 0.5)
     return {'n': n, 'board': board, 'xs': xs, 'ys': ys, 'src': src,
             'step': step, 'stone_r': stone_r, 'rect': rect,
-            'drift': drift}
+            'cursor_pt': cursor_pt, 'drift': drift, 'truncated': truncated}
 
 
 def main():
@@ -1587,3 +1673,65 @@ def stones_legal(n, board):
         c = grid[i][j]
         stones.append(['b' if c == 'X' else 'w', letters[j] + str(n - i)])
     return stones
+
+
+def detect_ko(n, board, my_char):
+    """检测当前局面我方即将提劫的'劫'形, 返回劫点 GTP 串(如 'G3')或 None。
+
+    劫形特征(标准2x2交替): 空点 P 只有一个正交邻子, 且其为对方单子、仅
+    此1气(=P, 处于被打吃); 同时 P 的两个对角为我方子。满足即判定为劫点——
+    该点本回合被劫规禁止, 须先找劫材, 下一回合(对手已应)才合法。
+
+    仅在'我方即将提劫'场景调用; 普通吃子(梯子/边角)因劫点会有≥2个正交
+    邻子(我方), 不会被误判。
+    """
+    opp = 'O' if my_char == 'X' else 'X'
+    letters = 'ABCDEFGHJKLMNOPQRST'[:n]
+
+    def _grp(y, x):
+        col = board[y][x]
+        if col not in 'XO':
+            return 0, set()
+        q = [(y, x)]
+        seen = {(y, x)}
+        grp = set()
+        libs = set()
+        while q:
+            yy, xx = q.pop()
+            grp.add((yy, xx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = yy + dy, xx + dx
+                if 0 <= ny < n and 0 <= nx < n:
+                    if board[ny][nx] == '.':
+                        libs.add((ny, nx))
+                    elif board[ny][nx] == col and (ny, nx) not in seen:
+                        seen.add((ny, nx))
+                        q.append((ny, nx))
+        return len(grp), libs
+
+    for i in range(n):
+        for j in range(n):
+            if board[i][j] != '.':
+                continue
+            orth = []
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = i + dy, j + dx
+                if 0 <= ny < n and 0 <= nx < n and board[ny][nx] in 'XO':
+                    orth.append((ny, nx))
+            if len(orth) != 1:        # 劫点仅1个正交邻子(对方单子)
+                continue
+            oy, ox = orth[0]
+            if board[oy][ox] != opp:
+                continue
+            size, libs = _grp(oy, ox)
+            if size != 1 or libs != {(i, j)}:
+                continue              # 必须是对方单子且仅此1气
+            diag = 0
+            for dy, dx in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
+                ny, nx = i + dy, j + dx
+                if 0 <= ny < n and 0 <= nx < n and board[ny][nx] == my_char:
+                    diag += 1
+            if diag >= 2:             # 两对角为我方子 -> 2x2交替劫形
+                return letters[j] + str(n - i)
+    return None
+

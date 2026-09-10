@@ -410,7 +410,12 @@ def anchor_turn_visual(counts, assist, res_cur):
             #    (徽章落子后/启动瞬间滞后, obox 为确认信号)。
             if not _capture:
                 if _have_geo and _have_obox and _g == _obox_turn:
-                    _turn, _tie = _g, ''
+                    if _arith == _g:
+                        _turn, _tie = _g, ''
+                    else:
+                        # 视觉两路一致却与算术(地面真值)矛盾: 落子后徽章/绿框
+                        # 滞后同指上一手, 算术(子数奇偶)实时更可靠, 采信算术
+                        _turn, _tie = _arith, ', 视觉一致但悖算术->取算术(徽章/绿框滞后)'
                 elif _have_geo and _have_obox:
                     if _arith == _g:
                         _turn, _tie = _g, ', geo=算术(obox异)'
@@ -844,6 +849,13 @@ def trend_record(board_n, board_cur, move_no, to_move=None):
 VIS_MINE_T = 0.12
 VIS_OPP_T = 0.14
 VIS_OVERRIDE_S = 15.0   # 视觉与算术矛盾超过该时长则无视视觉放行(防卡死)
+# 回合锁定: 任何"确定的回合翻转"(board-change/落子/弹窗)之后进入锁窗,
+# 锁窗内屏蔽"等待期视觉校正"翻回合。根因=对方落子后绿框横幅滞后数秒仍显示
+# 我方行棋, 旧逻辑(门槛12s)在滞后期内连续两次视觉=我方会把回合误翻回我方。
+# 15s > 实测滞后窗(<8s)留余量; 锁窗覆盖滞后全程, 之后视觉校正才生效(真虚着
+# 仍能救回, 仅延迟约 锁窗+连续两次采样)。
+TURN_LOCK_SECS = 15.0
+TURN_LOCK = {'until': 0.0}
 _VIS_REF = {'mine': None, 'opp': None}
 
 # ---- 点击/悬停状态 ----
@@ -1234,6 +1246,9 @@ def main():
         i = sys.argv.index('--size')
         SIZE_FIX = int(sys.argv[i + 1])
         assert SIZE_FIX in (9, 13, 19)
+    if '--mode' in sys.argv:
+        i = sys.argv.index('--mode')
+        br.set_game_mode(sys.argv[i + 1])
     WAIT_NEW = '--wait-new' in sys.argv
     BEEP_ON = '--beep' in sys.argv
     DETECT_FIRST = '--detect-first' in sys.argv
@@ -1481,6 +1496,8 @@ def main():
     extreme_count = 0       # 双视角极端分化连续次数
     last_flip = 0.0         # 上次自动翻转执色时间
     bad_points = set()      # 被拒落点黑名单(劫争等), 盘面变化时清空
+    ko_state = {'point': None, 'turn': -1}  # 劫点及被禁的我方回合序号
+    my_turn_seq = 0         # 每进入我方落子分支自增, 约束劫禁只限当回合
     _last_err = {}          # 异常去抖
 
     # 角标持续采样后台线程(并行观察, 仅记录; 真值确认后再并入判定)
@@ -1678,6 +1695,9 @@ def main():
                         # 下一手必是对方(横幅判定已取消, 不依赖 OCR)
                         mover = 'black' if db >= 1 else 'white'
                         turn = other(mover)
+                        TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
+                        print(f'[锁帧] 回合锁定{TURN_LOCK_SECS:.0f}s(对方落子) '
+                              f'期间忽略视觉翻回合, 防绿框滞后误翻')
                         cand = None
                         last_activity = time.time()
                         failed_cycles = 0
@@ -1780,7 +1800,8 @@ def main():
             # 校正误翻回合 -> 启动门槛 4s 提到 12s(滞后窗通常 <8s, 之后
             # 视觉仍=我方才是真"对方虚着"); 且每个对方回合只允许翻一次。
             if (turn != assist and time.time() - last_change > 12.0
-                    and not _vis_flipped):
+                    and not _vis_flipped
+                    and time.time() >= TURN_LOCK['until']):
                 if time.time() - _vis_my_at > 3.0:
                     _vis_my_at = time.time()
                     try:
@@ -1838,6 +1859,7 @@ def main():
                         print('[停一手] 对方虚着, 轮到我们')
                         turn = assist
                         acted_counts = (-1, -1)
+                        TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
                 except Exception:
                     pass
 
@@ -2107,6 +2129,20 @@ def main():
                 last_mv = None
                 same_fails = 0
                 forced = []  # 读盘漏子时手动标记的占位点
+                # 劫争检测: 我方即将提劫但该点本回合被劫规禁止(须先找劫材),
+                # 主动把劫点加入黑名单, 让引擎改选他处; 下一回合(对手已应)解禁。
+                my_turn_seq += 1
+                _kko = br.detect_ko(n, board, 'X' if assist == 'black' else 'O')
+                if _kko is not None:
+                    if ko_state['point'] == _kko and ko_state['turn'] == my_turn_seq:
+                        bad_points.add(_kko)        # 仍为本回合: 继续禁
+                    elif ko_state['point'] != _kko:
+                        ko_state = {'point': _kko, 'turn': my_turn_seq}
+                        bad_points.add(_kko)        # 新劫: 本回合禁
+                    else:
+                        ko_state = {'point': None, 'turn': -1}  # 已到下一回合: 解禁
+                else:
+                    ko_state = {'point': None, 'turn': -1}
                 for attempt in range(3):
                     stones = br.stones_legal(n, board) + forced
                     if attempt == 0 and 'compute_start' not in _MOVE_T:
@@ -2486,6 +2522,7 @@ def main():
                         turn = other(assist)
                         acted_counts = counts
                         _vis_flipped = False
+                    TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
                     print('✔ 已落子 ' + mv +
                           ('(对手已应)' if not placed else ''))
                     evt('落子确认')

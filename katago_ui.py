@@ -34,6 +34,9 @@ VISIT_OPTIONS = [('轻快 (100, 引擎≈0.03s/手)', '100'),
 DEFAULT_VISITS = '8000'
 WOOD = '#ecd9a2'
 LINE = '#6b4f2a'
+# 对局模式: 下拉显示中文, 底层值仍为 board_reader 所需的英文键
+MODE_CN2EN = {'匹配': 'match', 'AI对战': 'ai', '好友友谊赛': 'friend',
+              '挑战赛': 'challenge'}
 
 
 class KatagoUI:
@@ -57,6 +60,7 @@ class KatagoUI:
         self.root.geometry('980x660')
         self.root.minsize(780, 540)
         self.root.resizable(True, True)
+        self.mode_var = tk.StringVar(value='挑战赛')  # 对局模式(中文显示, 底层英文)
 
         frm = tk.Frame(self.root, padx=14, pady=8)
         frm.pack(fill='x')
@@ -92,13 +96,28 @@ class KatagoUI:
                  fg='#888888', font=('Microsoft YaHei', 8)).grid(
             row=3, column=1, columnspan=3, sticky='w')
 
-        tk.Label(frm, text='AI 算力:', font=('Microsoft YaHei', 10)).grid(
+        tk.Label(frm, text='对局模式:', font=('Microsoft YaHei', 10)).grid(
             row=4, column=0, sticky='w', pady=(6, 0))
+
+        def _on_mode_change(cn):
+            # 实时同步到主进程识别: 切换即生效(右侧实时面板用全局 GAME_MODE)
+            br.set_game_mode(MODE_CN2EN.get(cn, 'challenge'))
+
+        mode_menu = tk.OptionMenu(
+            frm, self.mode_var, '匹配', 'AI对战', '好友友谊赛', '挑战赛',
+            command=_on_mode_change)
+        mode_menu.config(font=('Microsoft YaHei', 9))
+        mode_menu.grid(row=4, column=1, columnspan=3, sticky='w', pady=(6, 0))
+        # 初始值同步(默认 challenge)
+        br.set_game_mode(MODE_CN2EN.get(self.mode_var.get(), 'challenge'))
+
+        tk.Label(frm, text='AI 算力:', font=('Microsoft YaHei', 10)).grid(
+            row=5, column=0, sticky='w', pady=(6, 0))
         self.visits_var = tk.StringVar(value=DEFAULT_VISITS)
         menu = tk.OptionMenu(frm, self.visits_var,
                              *[v for _, v in VISIT_OPTIONS])
         menu.config(font=('Microsoft YaHei', 9))
-        menu.grid(row=4, column=1, columnspan=3, sticky='w', pady=(6, 0))
+        menu.grid(row=5, column=1, columnspan=3, sticky='w', pady=(6, 0))
 
         self._btn_key = None     # 游戏按钮集合键(变化才重建, 防闪动)
         self._board_blank = False   # 当前画布是否已显示"无棋盘"占位
@@ -108,22 +127,22 @@ class KatagoUI:
         tk.Checkbutton(frm, text='自动续战: 终局后自动点[重新匹配]并继续下一盘',
                        variable=self.wait_var,
                        font=('Microsoft YaHei', 9)).grid(
-            row=5, column=0, columnspan=4, sticky='w', pady=(8, 0))
+            row=6, column=0, columnspan=4, sticky='w', pady=(8, 0))
 
         self.maxgames_var = tk.StringVar(value='')
         tk.Label(frm, text='续战上限(盘):', font=('Microsoft YaHei', 10)).grid(
-            row=6, column=0, sticky='w', pady=(4, 0))
+            row=7, column=0, sticky='w', pady=(4, 0))
         tk.Entry(frm, textvariable=self.maxgames_var, width=6,
                  font=('Microsoft YaHei', 10)).grid(
-            row=6, column=1, sticky='w', pady=(4, 0))
+            row=7, column=1, sticky='w', pady=(4, 0))
         tk.Label(frm, text='(留空=无限续战)', fg='#888888',
                  font=('Microsoft YaHei', 8)).grid(
-            row=6, column=2, columnspan=2, sticky='w', pady=(4, 0))
+            row=7, column=2, columnspan=2, sticky='w', pady=(4, 0))
 
         tk.Checkbutton(frm, text='终局/停止时响提示音',
                        variable=self.beep_var,
                        font=('Microsoft YaHei', 9)).grid(
-            row=7, column=0, columnspan=4, sticky='w')
+            row=8, column=0, columnspan=4, sticky='w')
 
         btns = tk.Frame(self.root, pady=4)
         btns.pack(fill='x', padx=10)
@@ -766,16 +785,23 @@ class KatagoUI:
             b.configure(state=st)
         self.btn_stop.configure(state='normal' if running else 'disabled')
 
+    def _mode_arg(self):
+        """对局模式 -> --mode 启动参数(各模式棋盘位置/缩放有细微偏差)。"""
+        cn = self.mode_var.get()
+        m = MODE_CN2EN.get(cn, 'challenge')  # 中文显示, 转回 board_reader 英文键
+        return ['--mode', m]
+
     def start_play(self):
         color = self.color_var.get()
         args = ['katago_play.py', color]
         tv = self.turn_var.get()
         if tv in ('black', 'white'):
             args += ['--turn', tv]     # 人工兜底: 手动指定当前行棋方
-        self._spawn(args + self._common_args())
+        self._spawn(args + self._mode_arg() + self._common_args())
 
     def start_watch(self):
-        self._spawn(['katago_suggest.py', '--watch'] + self._common_args())
+        self._spawn(['katago_suggest.py', '--watch'] + self._mode_arg()
+                    + self._common_args())
 
     def start_suggest(self):
         args = ['katago_suggest.py']
@@ -783,6 +809,7 @@ class KatagoUI:
         if sv != '0':
             args += ['--size', sv]
         args += ['--visits', self.visits_var.get()]
+        args += self._mode_arg()
         self._spawn(args)
 
     def stop(self):

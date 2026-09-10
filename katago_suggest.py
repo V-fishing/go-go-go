@@ -118,6 +118,8 @@ def main():
     if '--size' in sys.argv:
         global SIZE_FIX
         SIZE_FIX = int(sys.argv[sys.argv.index('--size') + 1])
+    if '--mode' in sys.argv:
+        br.set_game_mode(sys.argv[sys.argv.index('--mode') + 1])
 
     def size_ok(res):
         if SIZE_FIX and res['n'] != SIZE_FIX:
