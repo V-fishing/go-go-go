@@ -316,7 +316,11 @@ def anchor_turn_visual(counts, assist, res_cur):
         _rw = br.window_rect(br.PID)
     except Exception:
         _rw = None
-    for _i in range(4):
+    # 多次采样取中位数: 抗开局"请落子"/倒计时提示等瞬时金色 UI 造成的假阳性
+    # (单次采样易采到闪烁金框 -> 误判我方行棋)。金框在我方计时区, 出现=我方
+    # 行棋, 无反转; 中位数可滤掉开局短暂闪烁, 读到真实状态。
+    _gfs = []
+    for _i in range(6):
         try:
             _arr = None
             _im = res_cur.get('img') if res_cur else None
@@ -324,21 +328,26 @@ def anchor_turn_visual(counts, assist, res_cur):
                 import numpy as _np
                 _arr = _np.asarray(_im).astype(_np.int16)
             _gf = winclick.gold_frame_ratio(_rw, _arr)
-            if _gf is None:
+            if _gf is not None:
+                _gfs.append(_gf)
+            else:
                 time.sleep(0.6)      # 未拿到当前帧: 重试取帧, 不猜
                 continue
-            _turn = assist if _gf >= winclick.GOLD_THR else _other
-            print(f'  锚定: 金框={_gf:.3f} (黑{counts[0]}白{counts[1]})'
-                  f' -> 轮到{"黑" if _turn == "black" else "白"}')
-            return _turn, 'visual'
         except Exception as _e:
             # 不再静默吞异常(此前 NameError 被吞导致连判失败却无提示)
             print(f'  [锚定异常] {type(_e).__name__}: {_e}')
-        time.sleep(0.6)
-    print('?? 视觉状态连续无法判定(读数失败或异值死区), 不猜奇偶;')
-    print('   请确认微信窗口在前台且处于对局页, 在 UI 里选[当前轮到]后'
-          '点[启动]重试')
-    return None, 'unresolved'
+        time.sleep(0.5)
+    if not _gfs:
+        print('?? 视觉状态连续无法判定(读数失败), 不猜奇偶;')
+        print('   请确认微信窗口在前台且处于对局页, 在 UI 里选[当前轮到]后'
+              '点[启动]重试')
+        return None, 'unresolved'
+    _gfs.sort()
+    _med = _gfs[len(_gfs) // 2]
+    _turn = assist if _med >= winclick.GOLD_THR else _other
+    print(f'  锚定: 金框采样{_gfs} 中位={_med:.3f} (黑{counts[0]}白{counts[1]})'
+          f' -> 轮到{"黑" if _turn == "black" else "白"}')
+    return _turn, 'visual'
 
 
 
@@ -1358,9 +1367,6 @@ def main():
     _sig_stalled_at = 0.0     # 画面停滞提示节流
     _vis_gate_t = 0.0        # 行动门视觉采样节流
     _vis_opp_since = 0.0     # 视觉连续显示"对方回合"的起始时刻(0=无)
-    _vis_my_at = 0.0         # 等待期视觉采样节流
-    _vis_my_n = 0            # 等待期连续"色块在"次数
-    _vis_flipped = False     # 本对方回合是否已翻回过(只允许一次)
     last_pop = 0.0           # 弹窗应答扫描节流
     last_change = time.time()  # 最近一次盘面变化(显示对方思考时长)
     opening_since = None   # 自动续战新局(空盘)的开始时刻
@@ -1496,16 +1502,16 @@ def main():
                         if db < 1 and dw < 1:
                             # 无新增子(撤销/悔棋/消息框闪烁/鼠标悬停误读):
                             # 忽略。悬停与闪烁消息框都是"单次消失1-3颗"的小
-                            # 噪声(容忍); 弹窗遮挡致大片消失时也先静置等待
-                            # (求和/数子 20s 倒计时会自动回棋盘), 大片消失
-                            # 需持续 ~14 次读(~20-30s)才判结算
+                            # 噪声(容忍); 仅当"大片消失"(vanish_max>=8, 即
+                            # 数子遮挡/换局)才判疑似结算。注意: 对方长考期
+                            # 的纯小噪声(单次消失1-3子)绝不判结算, 否则会误
+                            # 把正常长考当结算而中断对局
                             _van = -(db + dw)
                             vanish_sum += _van
                             if _van > vanish_max:
                                 vanish_max = _van
                             consec_bad += 1
-                            if (vanish_max >= 8 and consec_bad >= 14) \
-                                    or consec_bad >= 40:
+                            if vanish_max >= 8 and consec_bad >= 14:
                                 g3 = end_or_wait(
                                     f'!! 读数持续异常(连续{consec_bad}次'
                                     f'无新增消失, 单次最大{vanish_max}子, '
@@ -1590,7 +1596,6 @@ def main():
                         evt('检测到落子')
                         global _MOVE_T
                         _MOVE_T = {'detected': time.time()}
-                        _vis_flipped = False
                         if mover != assist:
                             # 对手落子后, 立即用其真实落点作 prefix 续算我方
                             # 应手(异步线程, 不阻塞检测循环)。把 4-5s 冷算移到
@@ -1666,37 +1671,6 @@ def main():
                         print(f'[视觉行棋] 金框: {_ws} | 轮到{_turn_s}')
                 except Exception:
                     pass
-
-            # 等待期视觉校正 + 参考学习: 官方几何优先; 视觉持续=我方回合
-            # 而盘面稳定未变(对方虚着未被弹窗捕获等), 连续两次则翻回我方。
-            # 我方落子后横幅滞后数秒仍显示"白方行棋"(视觉=我方)会误导本
-            # 校正误翻回合 -> 启动门槛 4s 提到 12s(滞后窗通常 <8s, 之后
-            # 视觉仍=我方才是真"对方虚着"); 且每个对方回合只允许翻一次。
-            if (turn != assist and time.time() - last_change > 12.0
-                    and not _vis_flipped
-                    and time.time() >= TURN_LOCK['until']):
-                if time.time() - _vis_my_at > 3.0:
-                    _vis_my_at = time.time()
-                    try:
-                        _srcw, _resw, _infow = visual_turn(res_cur, assist=assist)
-                        # gold: 行棋方颜色 -> mine/opp; 其余一律不可判
-                        _wcls = ('mine' if _resw == assist else 'opp') \
-                            if _srcw == 'gold' else None
-                        _wf = None
-                    except Exception:
-                        _wcls = None
-                        _wf = None
-                    if _wcls == 'mine':
-                        _vis_my_n += 1
-                        if _vis_my_n >= 2:   # 连续两次(约6s)视觉=我方
-                            print('[视觉行棋] 等待期视觉=我方(金框) '
-                                  '而盘面未变, 翻回我方回合')
-                            turn = assist
-                            acted_counts = (-1, -1)
-                            _vis_my_n = 0
-                            _vis_flipped = True
-                    else:
-                        _vis_my_n = 0
 
             # 对局中弹窗智能应答(每 ~3s): 和棋拒绝/认输确定/数子同意/停一手
             if time.time() - last_pop > 3.0:
@@ -2379,7 +2353,6 @@ def main():
                         # 只有我们落了子 -> 等对手应
                         turn = other(assist)
                         acted_counts = counts
-                        _vis_flipped = False
                     TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
                     print('✔ 已落子 ' + mv +
                           ('(对手已应)' if not placed else ''))

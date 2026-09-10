@@ -84,7 +84,7 @@ GOLD_THR = 0.094                    # 判据阈值
 ```
 
 - 调用方：`visual_turn()`（`katago_play.py:269`，主循环每轮视觉观察）与 `anchor_turn_visual()`（`:300`，开局锚定）。两者均**只有金框**一种判据，采样失败一律返回不确定由上游重试，不猜。
-- 空盘铁律：`anchor_turn_visual` 在空盘（`counts==0`）直接锚定 `turn='black'`（黑先手），无需视觉判定。
+- 空盘铁律（备用）：`anchor_turn_visual` 在空盘（`counts==0`）直接锚定 `turn='black'`（黑先手），无需视觉判定。注：开局实测为非空盘（盘面上 `counts` 常为 `(1,1)`，属平台占位显示），故该分支通常不被触发，轮次实际由金框锚定（多次采样取中位数）得出。
 
 ## 5. 劫检测 `detect_ko()`（`board_reader.py:1678`）
 
