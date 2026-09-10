@@ -1426,6 +1426,8 @@ def main():
     _sig_stalled_at = 0.0     # 画面停滞提示节流
     _vis_gate_t = 0.0        # 行动门视觉采样节流
     _vis_opp_since = 0.0     # 视觉连续显示"对方回合"的起始时刻(0=无)
+    _gold_latest = [None]    # 最近一次金框读数(供"金框纠正闸"判定)
+    _gold_my_since = [0.0]   # 金框连续显示"我方"的起始时刻(0=无)
     last_pop = 0.0           # 弹窗应答扫描节流
     last_change = time.time()  # 最近一次盘面变化(显示对方思考时长)
     opening_since = None   # 自动续战新局(空盘)的开始时刻
@@ -1768,6 +1770,7 @@ def main():
                         except Exception:
                             _arr2 = None
                     _gf2 = winclick.gold_frame_ratio(_rw2, _arr2)
+                    _gold_latest[0] = _gf2    # 保存供"金框纠正闸"使用
                     _ws = ('' if _gf2 is None
                            else ' 金框%.3f(%s)' % (_gf2, '我方' if _gf2 >= winclick.GOLD_THR
                                                   else '对方'))
@@ -2065,6 +2068,28 @@ def main():
                                 opening_blk_n = 0
                         time.sleep(0.4)
                         continue
+
+            # ---- 金框纠正闸(用户规格: 金框=我方 即我方行棋, 不受其他干扰) ----
+            # turn 由"落子算术"维护, 偶尔会因漏读/提子/时序而停在错误的一方,
+            # 表现为"金框明明=我方却显示轮到对方、干等不落子"。金框是唯一判据,
+            # 故当金框连续稳定显示我方、而 turn 仍是对方时, 直接纠正 turn 并
+            # 放行落子门(同时清 acted_counts, 防其等于当前盘面而卡住)。
+            if turn != assist and _gold_latest[0] is not None:
+                if _gold_latest[0] >= winclick.GOLD_THR:
+                    _gold_my_since[0] = (_gold_my_since[0] or now)
+                    if now - _gold_my_since[0] >= 3.0:
+                        print('[金框纠正] 金框持续=我方(%.3f) 但轮到%s, '
+                              '按金框纠正为我方(%s)'
+                              % (_gold_latest[0],
+                                 '黑' if turn == 'black' else '白',
+                                 '黑' if assist == 'black' else '白'))
+                        turn = assist
+                        acted_counts = (-1, -1)
+                        _gold_my_since[0] = 0.0
+                else:
+                    _gold_my_since[0] = 0.0
+            else:
+                _gold_my_since[0] = 0.0
 
             # 我方回合: 分析并落子
             if turn == assist and counts != acted_counts:
