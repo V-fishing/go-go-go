@@ -1,7 +1,7 @@
 """腾讯围棋 AI 陪练 - 启动配置界面 (线程化, 不卡顿)
 
 左侧: 日志; 右侧: 实时识别棋盘(与腾讯围棋画面核对)。
-顶部: 游戏按钮投影(OCR 后台识别, 点击映射到腾讯围棋窗口)。
+顶部: 操作按钮(启动自动落子 / 连续观战 / 单次分析 / 停止)。
 配置: 执子(自动识别) / 当前轮到 / 棋盘尺寸(0=OCR自动) / AI算力 / 自动续战 / 提示音。
 仅用于: 人机/AI 对局、双方知情的对局。
 """
@@ -23,9 +23,6 @@ import winclick
 PY = sys.executable
 LOG = os.path.join(TOOLS, 'katago_ui.log')
 STATE = os.path.join(TOOLS, 'ui_state.json')   # 主进程状态投影文件
-BTN_KEYS = ('智能裁判', '裁判', '停一手', '虚着', '认输', '数子', '形势判断',
-            '悔棋', '提示', '确定', '确认', '取消', '重新匹配', '续战',
-            '再来一局', '继续', '返回', '是', '否')
 # 引擎耗时按实测 ~3000 visits/s 标注(RTX3050, 未含读盘/OCR)
 VISIT_OPTIONS = [('轻快 (100, 引擎≈0.03s/手)', '100'),
                  ('标准 (500, 引擎≈0.2s/手)', '500'),
@@ -51,7 +48,6 @@ class KatagoUI:
         self._redraw_pending = False
         self._board_busy = False
         self._fast_poll = False      # 盘面变化后快速复读(降镜像延迟)
-        self._btn_busy = False
         self._q = __import__('queue').Queue()
         self._trend = []
         self._trend_my = True   # True=我方视角 False=黑方视角
@@ -119,7 +115,6 @@ class KatagoUI:
         menu.config(font=('Microsoft YaHei', 9))
         menu.grid(row=5, column=1, columnspan=3, sticky='w', pady=(6, 0))
 
-        self._btn_key = None     # 游戏按钮集合键(变化才重建, 防闪动)
         self._board_blank = False   # 当前画布是否已显示"无棋盘"占位
         self._cv_size = (0, 0)      # 画布最近一次绘制尺寸
         self.wait_var = tk.BooleanVar(value=False)
@@ -158,17 +153,6 @@ class KatagoUI:
         for b in (self.btn_start, self.btn_watch, self.btn_suggest,
                   self.btn_stop):
             b.pack(side='left', padx=4)
-
-        # 游戏按钮投影条(后台 OCR, 点击映射, 不抢鼠标)
-        bar = tk.Frame(self.root)
-        bar.pack(fill='x', padx=10, pady=(0, 2))
-        tk.Label(bar, text='游戏按钮:', font=('Microsoft YaHei', 9)).pack(
-            side='left')
-        self.btn_frame = tk.Frame(bar)
-        self.btn_frame.pack(side='left', padx=4)
-        self.btn_status = tk.Label(bar, text='', fg='#999999',
-                                   font=('Microsoft YaHei', 8))
-        self.btn_status.pack(side='left')
 
         main = tk.Frame(self.root)
         main.pack(fill='both', expand=True, padx=10, pady=4)
@@ -214,7 +198,6 @@ class KatagoUI:
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
         self.poll_log()
         self.poll_board()
-        self.poll_buttons()
         self.root.after(300, self._drain_q)
         self.poll_trend()
 
@@ -355,16 +338,12 @@ class KatagoUI:
                     self._board_result(payload)
                 elif kind == 'state':
                     self._state_result(payload)
-                else:
-                    self._buttons_result(payload)
         except Exception:
             pass
         if not self._board_busy:
             delay = 300 if self._fast_poll else 1000
             self._fast_poll = False
             self.root.after(delay, self.poll_board)
-        if not self._btn_busy:
-            self.root.after(2000, self.poll_buttons)
         self.root.after(600, self.poll_state)
         self.root.after(300, self._drain_q)
 
@@ -472,54 +451,6 @@ class KatagoUI:
                 else:
                     cv.create_oval(x - r, y - r, x + r, y + r,
                                    fill='#fafafa', outline='#888888')
-
-    # ---------- 游戏按钮投影(后台 OCR) ----------
-    def poll_buttons(self):
-        if self._btn_busy:
-            self.root.after(2000, self.poll_buttons)
-            return
-        self._btn_busy = True
-
-        def worker():
-            try:
-                items = winclick.ocr_buttons(BTN_KEYS)
-                self._q.put(('buttons', items))
-            except Exception:
-                self._q.put(('buttons', []))
-            finally:
-                self._btn_busy = False
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _buttons_result(self, items):
-        try:
-            labels = []
-            seen = set()
-            for label, cx, cy, _w, _h in items:
-                if label in seen:
-                    continue
-                seen.add(label)
-                labels.append((label, cx, cy))
-            key = tuple(labels)
-            if key != self._btn_key:
-                # 按钮集合变化才重建(每2s轮询但按钮不变时保持原控件, 防闪动)
-                self._btn_key = key
-                for w in self.btn_frame.winfo_children():
-                    w.destroy()
-                for label, cx, cy in labels:
-                    tk.Button(self.btn_frame, text=label,
-                              font=('Microsoft YaHei', 9),
-                              command=lambda t=label, x=cx, y=cy:
-                              self._game_click(t, x, y)).pack(side='left',
-                                                              padx=2)
-            self.btn_status.configure(
-                text='' if labels else '(未检测到游戏按钮)')
-        except Exception:
-            pass
-
-    def _game_click(self, label, x, y):
-        winclick.post_click(x, y)
-        self.write_log('[按钮映射] 点击: {} @({},{})'.format(label, x, y))
 
     # ---------- 胜率趋势图 ----------
     def toggle_trend(self):

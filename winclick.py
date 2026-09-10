@@ -242,32 +242,10 @@ def click_confirm():
     return click_label('确认', ('确定',))
 
 
-AI_WORDS = ('精灵', '绝艺', '机器人', '电脑', '人机', 'AI')
-PAGE_NOGO = ('复盘', '聊天', '成员', '积分', '胜率曲线', '棋谱', '大厅')
 
 
-def _small_discs(a, x0, y0, x1, y1):
-    """在区域里找小实心圆点(头像棋子颜色标记): 返回 [(color, cx, cy)]"""
-    import numpy as np
-    h, w = a.shape[:2]
-    x0, y0 = max(0, x0), max(0, y0)
-    x1, y1 = min(w - 1, x1), min(h - 1, y1)
-    found = []
-    for y in range(y0 + 3, y1 - 3, 2):
-        for x in range(x0 + 3, x1 - 3, 2):
-            patch = a[y - 2:y + 3, x - 2:x + 3].reshape(-1, 3)
-            lum = patch.mean()
-            chroma = (patch.max(axis=1) - patch.min(axis=1)).mean()
-            if lum < 95 and chroma < 60:
-                c = 'black'
-            elif lum > 215 and chroma < 40:
-                c = 'white'
-            else:
-                continue
-            if all((x - fx) ** 2 + (y - fy) ** 2 > 36
-                   for _, fx, fy in found):
-                found.append((c, x, y))
-    return found
+
+
 
 
 CALIB_AVATAR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -322,66 +300,10 @@ def classify_avatar_box(img):
     return None
 
 
-def _name_row_y(rect):
-    """顶部名字行 y(窗口坐标): OCR 找含 段/级 的文本行; None=找不到"""
-    try:
-        from PIL import ImageGrab
-        img = ImageGrab.grab(bbox=(rect[0], rect[1], rect[2],
-                                   rect[1] + int((rect[3]-rect[1])*0.5)))
-        img2 = img.resize((img.width*2, img.height*2), 1).convert('RGB')
-        png = save_tmp(img2, 'nrow')
-        ys = []
-        for it in ocr_items(png):
-            t = it.get('text', '')
-            if ('段' in t or '级' in t) and len(t) >= 4:
-                ys.append(it.get('y', 0) // 2)
-        if not ys:
-            return None
-        ys.sort()
-        return ys[len(ys)//2]
-    except Exception:
-        return None
 
 
-def _blob_compact(crop, color):
-    """校验候选色像素成紧凑圆斑(拒绝文字横条/边框伪影)"""
-    import numpy as np
-    a = np.asarray(crop.convert('RGB')).astype(np.int16)
-    lum = a.mean(axis=2)
-    chroma = a.max(axis=2) - a.min(axis=2)
-    if color == 'black':
-        m = (lum < 110) & (chroma < 70)
-    else:
-        m = lum > 230
-    ys, xs = np.where(m)
-    n = len(xs)
-    if n < 24:
-        return False
-    w = int(xs.max()) - int(xs.min()) + 1
-    h = int(ys.max()) - int(ys.min()) + 1
-    if not (7 <= w <= 21 and 7 <= h <= 21):
-        return False
-    if w / h < 0.55 or w / h > 1.8:
-        return False
-    return n / (w * h) >= 0.4
 
 
-def _scan_side_disc(img, x0, x1, y0, y1, step=5, win=28):
-    """区域内滑动找棋子: 返回 (颜色, 分数, cx, cy) 最优或 None"""
-    W, H = img.size
-    x0, x1 = max(14, x0), min(W - win - 14, x1)
-    y0, y1 = max(2, y0), min(H - win - 2, y1)
-    best = None
-    for y in range(y0, y1, step):
-        for x in range(x0, x1, step):
-            crop = img.crop((x, y, x + win, y + win))
-            c = classify_avatar_box(crop)
-            if c is None or not _blob_compact(crop, c):
-                continue
-            sc = _disc_score(crop)
-            if best is None or sc > best[1]:
-                best = (c, sc, x + win // 2, y + win // 2)
-    return best
 
 
 def _strip_my_color(rect, img=None, a=None):
@@ -457,38 +379,7 @@ def avatar_indicators_vstrip(rect):
     return my
 
 
-def _disc_score(img):
-    """分类置信: 优势色的占比(用于邻域滑动选最优)"""
-    import numpy as np
-    a = np.asarray(img.convert('RGB')).astype(np.int16)
-    lum = a.mean(axis=2)
-    chroma = a.max(axis=2) - a.min(axis=2)
-    h, w = lum.shape
-    if h < 6 or w < 6:
-        return 0.0
-    border = np.concatenate([lum[:2, :].ravel(), lum[-2:, :].ravel(),
-                             lum[:, :2].ravel(), lum[:, -2:].ravel()])
-    bg = float(np.median(border))
-    dark = float(((lum < bg - 55) & (chroma < 50)).sum()) / lum.size
-    bright = float((lum > bg + 18).sum()) / lum.size
-    return max(dark, bright)
 
-
-def _avatar_centers(rect, a, y_top=60, y_bot=None):
-    """顶带内找头像大圆: 返回 [(cx, cy, r)]"""
-    import cv2
-    import numpy as np
-    if y_bot is None:
-        y_bot = a.shape[0] - 20
-    gray = cv2.cvtColor(np.asarray(a, dtype=np.uint8), cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray[y_top:y_bot, :], 40, 120)
-    circ = cv2.HoughCircles(edges, cv2.HOUGH_GRADIENT, dp=1.1, minDist=110,
-                            param1=80, param2=22, minRadius=18, maxRadius=55)
-    out = []
-    if circ is not None:
-        for cx, cy, r in np.round(circ[0]).astype(int):
-            out.append((cx, cy + y_top, int(r)))
-    return out
 
 
 def _my_stone_color_only(rect):
@@ -569,44 +460,7 @@ def _my_stone_color_only(rect):
     return 'black' if nb > nw else 'white'
 
 
-_top_cache = [None, 0.0]   # 棋盘上沿缓存 [值, 时间戳](无网格提示时复用)
 
-
-def _chip_bounds(rect, grid, H):
-    """绿框竖线带几何: 返回 (x0, x1, y_lo, y_hi, top, xc)。
-    x = 0.458*W ±8; y = 棋盘上沿往上 ~150px, 下限 y135 避开页面白色头部/
-    明亮带(板顶过矮的短窗口才放宽)。板顶来源: 主循环网格提示 -> 5s 缓存
-    -> 现读一次。"""
-    import time as _t
-    top = None
-    try:
-        if grid and 'ys' in grid and 'rect' in grid and rect:
-            _dy = grid['rect'][1] - rect[1]
-            top = (int(grid['ys'][0] - grid.get('step', 27) * 0.7) - 2) + _dy
-        elif _t.time() - _top_cache[1] < 5.0:
-            top = _top_cache[0]
-        if top is None:
-            import board_reader as _br
-            _g = _br.read_current(do_align=False, use_calib=False)
-            _dy2 = _g['rect'][1] - rect[1] if (_g and 'rect' in _g) else 0
-            top = (int(_g['ys'][0] - _g.get('step', 27) * 0.7) - 2
-                   + _dy2) if _g and 'ys' in _g else None
-            _top_cache[0] = top
-            _top_cache[1] = _t.time()
-    except Exception:
-        top = None
-    W = rect[2] - rect[0]
-    xc = int(W * 0.458)
-    x0, x1 = max(0, xc - 8), min(W, xc + 8)
-    if top is not None and top > 60:
-        y_hi = min(H - 2, top - 2)
-        y_lo = max(135, top - 150)
-        if y_hi - y_lo < 12:
-            y_lo = max(60, top - 150)
-    else:
-        # 板顶不可用: 扫窗高中上部, 保证区间非空
-        y_lo, y_hi = int(H * 0.15), min(H - 2, int(H * 0.42))
-    return x0, x1, y_lo, y_hi, top, xc
 
 
 GOLD_ROI = (80, 180, 150, 210)      # x0, y0, x1, y1 (窗口相对像素)
@@ -641,40 +495,7 @@ def gold_frame_ratio(rect=None, arr=None):
         return None
 
 
-def strip_box_stats(rect, grid=None, arr=None):
-    """绿框整块统计: 返回 (异占比 frac, 均值RGB) 或 None。
-    frac = 偏离框背景色(通道中位数)的像素占比——色块出现在框内任意
-    y 段都会推高它; 判定: 色块在=我方行棋(阈值由调用方定)。"""
-    try:
-        import numpy as np
-        if arr is None:
-            from PIL import ImageGrab
-            img = ImageGrab.grab(bbox=rect).convert('RGB')
-            a = np.asarray(img).astype(np.int16)
-        else:
-            a = arr
-        H = a.shape[0]
-        x0, x1, y_lo, y_hi, _t, _x = _chip_bounds(rect, grid, H)
-        if x1 - x0 < 4 or y_hi - y_lo < 4:
-            return None
-        blk = a[y_lo:y_hi, x0:x1].reshape(-1, 3)
-        mean = blk.mean(axis=0)
-        bg = np.median(blk, axis=0)
-        dist = np.abs(blk - bg).sum(axis=1)
-        frac = float((dist > 90).mean())
-        return frac, (int(round(mean[0])), int(round(mean[1])),
-                      int(round(mean[2])))
-    except Exception:
-        return None
 
-
-def strip_rgb_sig(rect, grid=None, arr=None):
-    """绿框整块颜色状态字符串(供日志): '均(r,g,b) 异0.xx'"""
-    st = strip_box_stats(rect, grid, arr)
-    if st is None:
-        return ''
-    frac, mean = st
-    return '均(%d,%d,%d) 异%.2f' % (mean[0], mean[1], mean[2], frac)
 
 
 def _is_game_page():
@@ -741,10 +562,7 @@ def avatar_my_color():
     return None
 
 
-def detect_my_color():
-    """识别我方执色 —— 只以官方头像角标颜色为准(avatar_calib.json)。
-    不做任何文本/名字/圆点推断; 读不到返回 None。"""
-    return avatar_my_color()
+
 
 
 def _match_turn_items(items):
@@ -836,21 +654,4 @@ def ocr_board_size():
     return None
 
 
-_size_cache = [None, 0.0]  # [值, 时间戳]
 
-
-def ocr_board_size_cached(ttl=5.0):
-    """OCR 路数(带缓存, ttl 秒内不重复 OCR)"""
-    import time as _t
-    now = _t.time()
-    if _size_cache[0] is not None and now - _size_cache[1] < ttl:
-        return _size_cache[0]
-    sz = ocr_board_size()
-    if sz is not None:
-        _size_cache[0] = sz
-        _size_cache[1] = now
-    return sz
-
-
-def clear_size_cache():
-    _size_cache[0] = None

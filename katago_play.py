@@ -735,7 +735,7 @@ def trend_record(board_n, board_cur, move_no, to_move=None):
 # ---- 视觉行棋(金框唯一判据)全局 ----
 VIS_OVERRIDE_S = 15.0   # 视觉显示对方回合超过该时长则放行(防卡死)
 # 回合锁定: 任何"确定的回合翻转"(board-change/落子/弹窗)之后进入锁窗,
-# 锁窗内屏蔽"等待期视觉校正"翻回合。根因=对方落子后绿框横幅滞后数秒仍显示
+# 锁窗内屏蔽"等待期视觉校正"翻回合。根因=对方落子后金框横幅滞后数秒仍显示
 # 我方行棋, 旧逻辑(门槛12s)在滞后期内连续两次视觉=我方会把回合误翻回我方。
 # 15s > 实测滞后窗(<8s)留余量; 锁窗覆盖滞后全程, 之后视觉校正才生效(真虚着
 # 仍能救回, 仅延迟约 锁窗+连续两次采样)。
@@ -1577,7 +1577,7 @@ def main():
                         turn = other(mover)
                         TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
                         print(f'[锁帧] 回合锁定{TURN_LOCK_SECS:.0f}s(对方落子) '
-                              f'期间忽略视觉翻回合, 防绿框滞后误翻')
+                              f'期间忽略视觉翻回合, 防金框滞后误翻')
                         cand = None
                         last_activity = time.time()
                         failed_cycles = 0
@@ -1647,7 +1647,6 @@ def main():
                 _chip_samp_at = now
                 try:
                     _rw2 = br.window_rect(br.PID)
-                    _grd2 = res_cur if (res_cur and 'ys' in res_cur) else None
                     # 复用主循环刚截的帧(免二次截屏, 边际成本 ~5ms)
                     _arr2 = None
                     _im2 = res_cur.get('img') if res_cur else None
@@ -1657,17 +1656,14 @@ def main():
                             _arr2 = _np.asarray(_im2).astype(_np.int16)
                         except Exception:
                             _arr2 = None
-                    _sig2 = winclick.strip_rgb_sig(_rw2, _grd2, _arr2)
-                    if _sig2:
-                        _gf2 = winclick.gold_frame_ratio(_rw2, _arr2)
-                        _ws = ('' if _gf2 is None
-                               else ' 金框%.3f(%s)' % (_gf2, '我方' if _gf2 >= winclick.GOLD_THR
-                                                      else '对方'))
-                        _log2 = _sig2 + _ws
-                        if _log2 != _sig_last:
-                            _sig_last = _log2
-                            _turn_s = '黑' if turn == 'black' else '白'
-                            print(f'[视觉行棋] 绿框: {_log2} | 轮到{_turn_s}')
+                    _gf2 = winclick.gold_frame_ratio(_rw2, _arr2)
+                    _ws = ('' if _gf2 is None
+                           else ' 金框%.3f(%s)' % (_gf2, '我方' if _gf2 >= winclick.GOLD_THR
+                                                  else '对方'))
+                    if _ws != _sig_last:
+                        _sig_last = _ws
+                        _turn_s = '黑' if turn == 'black' else '白'
+                        print(f'[视觉行棋] 金框: {_ws} | 轮到{_turn_s}')
                 except Exception:
                     pass
 
@@ -2147,7 +2143,6 @@ def main():
                             and col < len(xs) and i < len(ys)):
                         print(f'!! 引擎着法 {mv} 超出当前 {n} 路网格, '
                               '清缓存重新识别尺寸')
-                        winclick.clear_size_cache()
                         br.clear_grid_cache()
                         time.sleep(1)
                         continue
