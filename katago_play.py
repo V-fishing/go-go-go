@@ -319,8 +319,10 @@ def anchor_turn_visual(counts, assist, res_cur):
     # 多次采样取中位数: 抗开局"请落子"/倒计时提示等瞬时金色 UI 造成的假阳性
     # (单次采样易采到闪烁金框 -> 误判我方行棋)。金框在我方计时区, 出现=我方
     # 行棋, 无反转; 中位数可滤掉开局短暂闪烁, 读到真实状态。
+    # 实测金框为干净二值开关(我方~0.083 / 对方0.0000, 无闪烁), 3 次×0.3s
+    # 足以抗抖, 省去原 6×0.5s=3.0s 的启动延迟。
     _gfs = []
-    for _i in range(6):
+    for _i in range(3):
         try:
             _arr = None
             _im = res_cur.get('img') if res_cur else None
@@ -331,12 +333,12 @@ def anchor_turn_visual(counts, assist, res_cur):
             if _gf is not None:
                 _gfs.append(_gf)
             else:
-                time.sleep(0.6)      # 未拿到当前帧: 重试取帧, 不猜
+                time.sleep(0.4)      # 未拿到当前帧: 重试取帧, 不猜
                 continue
         except Exception as _e:
             # 不再静默吞异常(此前 NameError 被吞导致连判失败却无提示)
             print(f'  [锚定异常] {type(_e).__name__}: {_e}')
-        time.sleep(0.5)
+        time.sleep(0.3)
     if not _gfs:
         print('?? 视觉状态连续无法判定(读数失败), 不猜奇偶;')
         print('   请确认微信窗口在前台且处于对局页, 在 UI 里选[当前轮到]后'
@@ -742,14 +744,7 @@ def trend_record(board_n, board_cur, move_no, to_move=None):
 
 
 # ---- 视觉行棋(金框唯一判据)全局 ----
-VIS_OVERRIDE_S = 15.0   # 视觉显示对方回合超过该时长则放行(防卡死)
-# 回合锁定: 任何"确定的回合翻转"(board-change/落子/弹窗)之后进入锁窗,
-# 锁窗内屏蔽"等待期视觉校正"翻回合。根因=对方落子后金框横幅滞后数秒仍显示
-# 我方行棋, 旧逻辑(门槛12s)在滞后期内连续两次视觉=我方会把回合误翻回我方。
-# 15s > 实测滞后窗(<8s)留余量; 锁窗覆盖滞后全程, 之后视觉校正才生效(真虚着
-# 仍能救回, 仅延迟约 锁窗+连续两次采样)。
-TURN_LOCK_SECS = 15.0
-TURN_LOCK = {'until': 0.0}
+VIS_OVERRIDE_S = 15.0   # 视觉连续显示对方回合超过该时长则放行(防卡死)
 
 # ---- 点击/悬停状态 ----
 _rend = None
@@ -853,7 +848,7 @@ def page_no_game_reason():
     return None
 
 
-def _resolve_new_game_turn(assist, total, samples=6, gap=0.5):
+def _resolve_new_game_turn(assist, total, samples=3, gap=0.3):
     """新局重置时确定 turn。
 
     盘面为空(0子): 黑先手, turn='black'(原逻辑)。
@@ -861,7 +856,8 @@ def _resolve_new_game_turn(assist, total, samples=6, gap=0.5):
     counts 恒等于基线而永不触发落子检测), 此时绝不能用"空盘黑先"假设, 否则
     turn 会永久停在 black —— 表现为"轮到我方(金框/角标均正确)却不落子"的
     静默卡死。改用金框(谁行棋)判定: 金框=我方 -> turn=assist, 否则对方。
-    多次采样取中位数, 抗开局瞬时金色 UI 假阳性。
+    多次采样取中位数, 抗开局瞬时金色 UI 假阳性。实测金框为干净二值开关,
+    3 次×0.3s 足以抗抖(原 6×0.5s=3.0s, 压缩启动延迟)。
     """
     if total <= 0:
         return 'black'
@@ -895,6 +891,7 @@ def end_or_wait(msg):
     """终局/异常出口: 打印原因; wait_new 模式下自动点[重新匹配/续战]进入下一盘,
     返回新局读数 (n,board,counts,res); 否则返回 None(停止)。"""
     global AUTO_NEXT, GAMES_DONE, GAME_MOVES, GAME_LAST_KEY, CAP_HOLD
+    global assist, MY_SIDE, side
     _set_st(force=True, status='gameover', mv=msg[:40])
     print(msg)
     beep()
@@ -905,6 +902,7 @@ def end_or_wait(msg):
     print('--wait-new: 自动检测结算页并点击 [重新匹配] (10分钟内)...')
     deadline = time.time() + 600
     clicked = False
+    close_clicked = False   # 已点过结算/晋级弹窗的X关闭钮
     last_ocr = 0.0
     ocr_tries = 0
     xuzhan = False   # 找不到重新匹配时允许点[续战]
@@ -932,7 +930,35 @@ def end_or_wait(msg):
                 print(f'!! 已达设定局数上限({MAX_GAMES}盘), 停止')
                 return None
             print(f'检测到新局(第{GAMES_DONE}盘), 继续')
-            _set_st(force=True, game=GAMES_DONE, status='new',
+            # 新局执色重检测(分先轮换防串色): 上一局 assist 直接沿用会让第二局
+            # 仍显示上局执色 -> UI顶栏/胜率趋势图(皆读 MY_SIDE/assist)全部错。
+            # 所有终局路径(end_or_wait 的 7 个调用点)都经此 return 出口, 故在此
+            # 统一重判, 一处修复覆盖全部, 不再依赖各调用点单独补丁。
+            try:
+                time.sleep(0.6)  # 等结算->新局画面渲染稳定再读角标/金框
+                _gf0 = winclick.gold_frame_ratio(br.window_rect(br.PID), None)
+                _newc = None
+                if counts[0] + counts[1] == 0 and _gf0 is not None:
+                    # 空盘: 金框=我方行棋 唯一解释为我方执黑(黑先)
+                    _newc = 'black' if _gf0 >= winclick.GOLD_THR else 'white'
+                else:
+                    # 非空盘(对方已先落首手)/金框不可用: 角标直接读我方棋子色(权威)
+                    _newc = winclick.avatar_my_color()
+                if _newc and _newc != assist:
+                    print(f'[新局执色] 重新判定我方执'
+                          f'{("黑" if _newc == "black" else "白")}'
+                          f'(分先轮换), 已切换')
+                    assist = _newc
+                    MY_SIDE = assist
+                    side = '黑' if assist == 'black' else '白'
+                elif _newc:
+                    print(f'[新局执色] 我方执'
+                          f'{("黑" if _newc == "black" else "白")} (与上一局一致)')
+                else:
+                    print('  [新局执色] 角标/金框均不可读, 沿用上局执色')
+            except Exception as _e:
+                print(f'  [新局执色] 重判异常: {type(_e).__name__}: {_e}')
+            _set_st(force=True, game=GAMES_DONE, status='new', assist=assist,
                     move_no=0, mv='', wr=None, lead=None)
             return g
         # 2) OCR 找 [重新匹配] 按钮并点击(每 ~6s 一次, 最多试 10 次)
@@ -940,6 +966,31 @@ def end_or_wait(msg):
         if not clicked and now - last_ocr > 6:
             last_ocr = now
             ocr_tries += 1
+            # 2a) 先处理结算/晋级类弹窗: 无文字按钮, 仅右上角X。点X关闭后由
+            #     匹配队列自动进入下一局(比等[重新匹配]文字更稳, 这种弹窗常
+            #     根本没有该按钮, 导致旧逻辑等满 600s 超时退出)。
+            try:
+                _items = list(ocr_window_text())
+                _J = ''.join(t for t, _, _ in _items)
+            except Exception:
+                _items, _J = [], ''
+            # 关键守卫: 普通结算框有[续战]/[重新匹配]文字按钮 -> 必须走下面的
+            # 文字点击分支, 不可点✕(避免误点遮罩/无效). 仅"无文字按钮"的晋级/
+            # 结算框才用✕兜底关闭。
+            _has_words = any(k in _J for k in ('重新匹配', '续战', '确定',
+                                              '同意', '确认', '取消', '拒'))
+            if (not close_clicked and not _has_words
+                    and any(k in _J for k in ('晋级', '升段', '恭喜',
+                                             '对局结束', '你赢了', '你输了',
+                                             '胜利', '失败'))):
+                _xc = _popup_close_button()
+                if _xc:
+                    print(f'[结算弹窗] 检测到结算/晋级提示(无文字按钮), '
+                          f'点击X @({_xc[0]},{_xc[1]}) 关闭')
+                    click_at(_xc[0], _xc[1])
+                    close_clicked = True
+                    time.sleep(2.0)
+                    continue   # 关闭后等下一轮查新局
             if ocr_tries >= 10 and not xuzhan:
                 # 找不到[重新匹配]: 后半程允许点[续战](对方认输后常只有续战)
                 xuzhan = True
@@ -949,7 +1000,7 @@ def end_or_wait(msg):
                 print('!! 未找到 [重新匹配/续战] 按钮, 停止自动续战。')
                 return None
             keys = (REMATCH_KEYS + ('续战',)) if xuzhan else REMATCH_KEYS
-            for text, cx, cy in ocr_window_text():
+            for text, cx, cy in _items:
                 if any(k in text for k in keys):
                     print(f'检测到按钮 [{text}] @({cx},{cy}), 点击')
                     click_at(cx, cy)
@@ -1009,7 +1060,103 @@ def scan_popups():
         # "确定"以免误点取消。
         if click('确定', 'match_timeout', '匹配超时-重新匹配'):
             return 'match_timeout'
+    # 结算/晋级类弹窗: 仅当"无文字按钮"时才用右上角"绿圆+金✕"兜底关闭。
+    # 关键守卫: 普通结算框有[续战]/[重新匹配]文字按钮 -> 必须走文字点击,
+    # 不可点✕(且此时 ✕ 位置/语义不同, 误点会落在遮罩无效果或误操作)。
+    _has_words = any(k in J for k in ('重新匹配', '续战', '确定', '同意',
+                                      '确认', '取消', '拒'))
+    if (not _has_words
+            and any(k in J for k in ('晋级', '升段', '恭喜', '对局结束',
+                                     '你赢了', '你输了', '胜利', '失败'))):
+        xc = _popup_close_button()
+        if xc and now - _pop_hist.get('close_x', 0) > 8:
+            click_at(xc[0], xc[1])
+            _pop_hist['close_x'] = now
+            print(f'[弹窗应答] 结算/晋级弹窗(无文字按钮): 点击X关闭 @({xc[0]},{xc[1]})')
+            return 'close_popup'
     return None
+
+
+def _popup_close_button():
+    """在窗口顶部找"绿圆+金/白✕"关闭钮, 返回屏幕坐标(cx,cy)或None。
+    用于结算/晋级等无文字按钮弹窗。扫整个顶部横带(避开棋盘/头像等元素),
+    并取连通分量最右上的那个绿圆盘作 ✕(✕ 必在弹窗最右上), 内部须含亮心
+    以排除同色实心按钮/装饰菱形, 避免误命中。"""
+    try:
+        import numpy as _np
+        from PIL import ImageGrab
+        _rw = br.window_rect(br.PID)
+        _img = ImageGrab.grab(bbox=_rw).convert('RGB')
+    except Exception:
+        return None
+    _a = _np.asarray(_img).astype(int)
+    _h, _w = _a.shape[:2]
+    # ✕ 关闭钮在弹窗顶部: 晋级框在右上角(y≈0.16h), 结算框在标题行右侧
+    # (y≈0.22h)。统一扫整个顶部横带(避开棋盘/头像等其它元素), 再取最右上候选。
+    _x0, _x1 = int(_w * 0.45), min(_w, int(_w * 0.99))
+    _y0, _y1 = int(_h * 0.05), min(_h, int(_h * 0.32))
+    _s = _a[_y0:_y1, _x0:_x1]
+    _R, _G, _B = _s[:, :, 0], _s[:, :, 1], _s[:, :, 2]
+    # 绿圆盘色实测 ~ (110-135, 165-178, 125-140): G 明显高于 R/B 且差值够大
+    _teal = ((_G > 150) & (_G < 200) & (_R > 95) & (_R < 155)
+             & (_B > 110) & (_B < 160)
+             & ((_G - _R) > 25) & ((_G - _B) > 22))
+    _lum = (_R + _G + _B) / 3.0
+    _bright = _lum > 205   # ✕ 的米黄/白心
+    _ys, _xs = _np.where(_teal)
+    if len(_xs) < 30:
+        return None
+    # 连通分量聚类, 找出所有独立绿圆盘, 选最右上(x,y 都最大)的那个作 ✕
+    # (✕ 永远在弹窗最右上, 任何对话框内绿按钮/装饰都比它靠左/下)
+    _seen = set()
+    _comps = []
+    for _k in range(len(_xs)):
+        _yi, _xi = _ys[_k], _xs[_k]
+        if (int(_yi), int(_xi)) in _seen:
+            continue
+        # 4 邻域 flood fill
+        _stack = [(int(_yi), int(_xi))]
+        _minx = _maxx = _xi
+        _miny = _maxy = _yi
+        _cnt = 0
+        while _stack:
+            y, x = _stack.pop()
+            if (y, x) in _seen:
+                continue
+            _seen.add((y, x))
+            _cnt += 1
+            if x < _minx:
+                _minx = x
+            if x > _maxx:
+                _maxx = x
+            if y < _miny:
+                _miny = y
+            if y > _maxy:
+                _maxy = y
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = y + dy, x + dx
+                if (0 <= ny < _s.shape[0] and 0 <= nx < _s.shape[1]
+                        and (ny, nx) not in _seen and _teal[ny, nx]):
+                    _stack.append((ny, nx))
+        _bw, _bh = _maxx - _minx, _maxy - _miny
+        # 圆盘须够大且近似方形(圆), 内部含亮心(金/白✕)
+        if _bw < 10 or _bh < 10 or _bw > 60 or _bh > 60:
+            continue
+        if abs(_bw - _bh) > max(_bw, _bh) * 0.5:
+            continue
+        _inner = _bright[_miny:_maxy + 1, _minx:_maxx + 1]
+        if _inner.sum() < 8 or _inner.mean() > 0.75:
+            continue
+        _comps.append((_maxx + _minx, _maxy,   # (x中心, y中心)
+                       int((_minx + _maxx) / 2) + _x0,   # 屏幕x
+                       int((_miny + _maxy) / 2) + _y0))  # 屏幕y
+    if not _comps:
+        return None
+    # 取最右上: x 最大优先, 其次 y 最小(更靠上)
+    _comps.sort(key=lambda c: (c[0], -c[1]), reverse=True)
+    _cx = _comps[0][2] + _rw[0]
+    _cy = _comps[0][3] + _rw[1]
+    return (_cx, _cy)
 
 
 
@@ -1667,9 +1814,7 @@ def main():
                         # 会出现"轮到我却不落子"的静默卡死。
                         if turn == assist:
                             acted_counts = (-1, -1)
-                        TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
-                        print(f'[锁帧] 回合锁定{TURN_LOCK_SECS:.0f}s(对方落子) '
-                              f'期间忽略视觉翻回合, 防金框滞后误翻')
+                        print('对方落子 -> 轮到我方, 等待应手')
                         cand = None
                         last_activity = time.time()
                         failed_cycles = 0
@@ -1791,7 +1936,6 @@ def main():
                         print('[停一手] 对方虚着, 轮到我们')
                         turn = assist
                         acted_counts = (-1, -1)
-                        TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
                     elif ev in ('resign_ok', 'reconnect_end'):
                         _reason = '重连成功-对局已结束' if ev == 'reconnect_end' \
                             else '对方认输'
@@ -1808,6 +1952,8 @@ def main():
                         last_counts = counts
                         last_n = n
                         acted_counts = (-1, -1)
+                        # 新局执色已在 end_or_wait 内部统一重判(覆盖所有终局路径),
+                        # 此处无需再判, 直接用重判后的 assist 解 turn。
                         # 新局盘面非空时不能用"空盘黑先"(对方可能已落首手且
                         # 被设为基线), 用金框判定, 防 turn 停错导致不落子
                         turn = _resolve_new_game_turn(
@@ -2069,15 +2215,20 @@ def main():
                         time.sleep(0.4)
                         continue
 
-            # ---- 金框纠正闸(用户规格: 金框=我方 即我方行棋, 不受其他干扰) ----
-            # turn 由"落子算术"维护, 偶尔会因漏读/提子/时序而停在错误的一方,
-            # 表现为"金框明明=我方却显示轮到对方、干等不落子"。金框是唯一判据,
-            # 故当金框连续稳定显示我方、而 turn 仍是对方时, 直接纠正 turn 并
-            # 放行落子门(同时清 acted_counts, 防其等于当前盘面而卡住)。
+            # ---- 金框纠正闸(用户规格: 金框=我方 即我方行棋) ----
+            # turn 由"落子算术"维护, 偶尔因漏读/提子/时序停在错误的一方, 表现为
+            # "金框=我方却显示轮到对方、干等不落子"。此时用金框纠正 turn。
+            #
+            # 不使用 TURN_LOCK 锁窗(已移除): 实测金框在我方落子后是**瞬时**
+            # 切换的(~1.5s 内从 0.22 掉到 0.03), 不存在"我方刚落子后金框滞后
+            # 仍显示我方"的情况, 锁窗只会屏蔽掉真正需要纠正的时机。
+            # 判据改用精确金框色 #F9FE7B(见 winclick.gold_frame_ratio):
+            # 实测我方行棋 ~0.24, 对方行棋严格 0.0000, 无残留故无需宽限窗口。
+            # 仍保留 2s 连续确认, 仅防单帧抓取抖动(非滞后)。
             if turn != assist and _gold_latest[0] is not None:
                 if _gold_latest[0] >= winclick.GOLD_THR:
                     _gold_my_since[0] = (_gold_my_since[0] or now)
-                    if now - _gold_my_since[0] >= 3.0:
+                    if now - _gold_my_since[0] >= 2.0:
                         print('[金框纠正] 金框持续=我方(%.3f) 但轮到%s, '
                               '按金框纠正为我方(%s)'
                               % (_gold_latest[0],
@@ -2579,7 +2730,6 @@ def main():
                         # 只有我们落了子 -> 等对手应
                         turn = other(assist)
                         acted_counts = counts
-                    TURN_LOCK['until'] = time.time() + TURN_LOCK_SECS
                     print('✔ 已落子 ' + mv +
                           ('(对手已应)' if not placed else ''))
                     evt('落子确认')
